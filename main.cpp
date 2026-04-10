@@ -67,12 +67,15 @@ void note_capacity_prune(SearchContext* ctx);
 void note_legal_edge_prune(SearchContext* ctx);
 void note_dead_root_cache_hit(SearchContext* ctx);
 void note_impossible_root_prune(SearchContext* ctx);
+bool is_search_timed_out(SearchContext* ctx);
+bool should_use_fast_bounds(SearchContext* ctx);
 struct RootGenerationEstimate {
     std::uint64_t order_cost = 0;
     bool any_feasible_variant = false;
 };
 
-RootGenerationEstimate analyze_root_generation(const Graph& graph, int root);
+RootGenerationEstimate analyze_root_generation(const Graph& graph, int root,
+                                               SearchContext* ctx = nullptr);
 
 struct CompletionFingerprint {
     std::uint64_t lo = 0;
@@ -536,20 +539,67 @@ struct Graph {
         int new_nodes = 0;
     };
 
-    int rooted_loop_count(const Neighborhood& n) const {
+    static constexpr int branch_pair_index(int a, int b) {
+        if (a > b) {
+            std::swap(a, b);
+        }
+        int idx = 0;
+        for (int i = 0; i < 4; ++i) {
+            for (int j = i + 1; j < 4; ++j) {
+                if (i == a && j == b) {
+                    return idx;
+                }
+                ++idx;
+            }
+        }
+        return -1;
+    }
+
+    static int total_loops_from_pair_counts(const std::array<int, 6>& pair_counts) {
         int loops = 0;
+        for (int c : pair_counts) {
+            loops += c;
+        }
+        return loops;
+    }
+
+    bool pair_balance_satisfied(const std::array<int, 6>& pair_counts) const {
+        for (int c : pair_counts) {
+            if (c != 2) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool pair_balance_feasible(const std::array<int, 6>& pair_counts) const {
+        for (int c : pair_counts) {
+            if (c > 2) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::array<int, 6> rooted_pair_loop_counts(const Neighborhood& n) const {
+        std::array<int, 6> pair_counts{};
         for (int a = 0; a < 4; ++a) {
             for (int b = a + 1; b < 4; ++b) {
+                int idx = branch_pair_index(a, b);
                 for (int i = 0; i < 3; ++i) {
                     for (int j = 0; j < 3; ++j) {
                         if (shared_neighbor(n.children[a][i], n.children[b][j]) != -1) {
-                            ++loops;
+                            ++pair_counts[idx];
                         }
                     }
                 }
             }
         }
-        return loops;
+        return pair_counts;
+    }
+
+    int rooted_loop_count(const Neighborhood& n) const {
+        return total_loops_from_pair_counts(rooted_pair_loop_counts(n));
     }
 
     CompletionFingerprint completion_fingerprint(int root, const Neighborhood& n) const {
@@ -603,14 +653,14 @@ struct Graph {
     }
 
     bool participation_limit_reached(const Neighborhood& n, int root, int child) const {
-        if (nodes[root].role == Node::Role::leaf) {
+        if (nodes[root].role != Node::Role::center) {
             return false;
         }
         return rooted_participation_count(n, child) >= 2;
     }
 
     int participation_capacity_left(const Neighborhood& n, int root, int child) const {
-        if (nodes[root].role == Node::Role::leaf) {
+        if (nodes[root].role != Node::Role::center) {
             return nodes[child].free_slots();
         }
         return std::min(nodes[child].free_slots(), 2 - rooted_participation_count(n, child));
@@ -806,9 +856,12 @@ struct Graph {
         std::size_t max_results = 0,
         const std::vector<std::pair<int, int>>* pending_roots = nullptr,
         int max_depth = -1) const {
+        const bool enforce_pair_balance = (nodes[root].role == Node::Role::center);
         std::set<std::vector<std::pair<int, int>>> seen;
         std::vector<CompletionPlan> out;
-        if (rooted_loop_count(root) >= 12) {
+        auto initial_pairs = rooted_pair_loop_counts(n);
+        if ((enforce_pair_balance && pair_balance_satisfied(initial_pairs)) ||
+            (!enforce_pair_balance && rooted_loop_count(n) >= 12)) {
             out.push_back(CompletionPlan{});
             return out;
         }
@@ -819,7 +872,20 @@ struct Graph {
             Neighborhood greedy_n = n;
             std::vector<std::pair<int, int>> chosen;
 
-            while (greedy.rooted_loop_count(root) < 12) {
+            while (true) {
+                if (is_search_timed_out(ctx)) {
+                    chosen.clear();
+                    break;
+                }
+                std::array<int, 6> pair_counts = greedy.rooted_pair_loop_counts(greedy_n);
+                if ((enforce_pair_balance && greedy.pair_balance_satisfied(pair_counts)) ||
+                    (!enforce_pair_balance && greedy.rooted_loop_count(greedy_n) >= 12)) {
+                    break;
+                }
+                if (enforce_pair_balance && !greedy.pair_balance_feasible(pair_counts)) {
+                    chosen.clear();
+                    break;
+                }
                 int best_a = -1;
                 int best_b = -1;
                 int best_score = -1;
@@ -830,6 +896,10 @@ struct Graph {
                             for (int j = 0; j < 3; ++j) {
                                 int lhs = greedy_n.children[a][i];
                                 int rhs = greedy_n.children[b][j];
+                                int pair_idx = branch_pair_index(a, b);
+                                if (enforce_pair_balance && pair_counts[pair_idx] >= 2) {
+                                    continue;
+                                }
                                 if (greedy.participation_limit_reached(greedy_n, root, lhs) ||
                                     greedy.participation_limit_reached(greedy_n, root, rhs)) {
                                     continue;
@@ -859,7 +929,9 @@ struct Graph {
                 chosen.push_back({best_a, best_b});
             }
 
-            if (greedy.rooted_loop_count(root) >= 12) {
+            std::array<int, 6> final_pair_counts = greedy.rooted_pair_loop_counts(greedy_n);
+            if ((enforce_pair_balance && greedy.pair_balance_satisfied(final_pair_counts)) ||
+                (!enforce_pair_balance && greedy.rooted_loop_count(greedy_n) >= 12)) {
                 std::sort(chosen.begin(), chosen.end());
                 chosen.erase(std::unique(chosen.begin(), chosen.end()), chosen.end());
                 greedy_plan = CompletionPlan{
@@ -904,6 +976,9 @@ struct Graph {
         auto search = [&](auto&& self, const Graph& cur_graph,
                           const Neighborhood& cur_n, std::uint64_t forbidden_mask,
                           std::vector<std::pair<int, int>>& chosen) -> void {
+                if (is_search_timed_out(ctx)) {
+                    return;
+                }
                 if (max_results != 0 && out.size() >= max_results) {
                     return;
                 }
@@ -923,15 +998,21 @@ struct Graph {
                         if (max_depth >= 0 && pending_depth > max_depth) {
                             continue;
                         }
-                        if (!analyze_root_generation(cur_graph, pending_root).any_feasible_variant) {
+                        if (!analyze_root_generation(cur_graph, pending_root, ctx)
+                                 .any_feasible_variant) {
                             note_impossible_root_prune(ctx);
                             return;
                         }
                     }
                 }
 
-                int loops = cur_graph.rooted_loop_count(root);
-                if (loops >= 12) {
+                std::array<int, 6> pair_counts = cur_graph.rooted_pair_loop_counts(cur_n);
+                int loops = total_loops_from_pair_counts(pair_counts);
+                if (enforce_pair_balance && !cur_graph.pair_balance_feasible(pair_counts)) {
+                    return;
+                }
+                if ((enforce_pair_balance && cur_graph.pair_balance_satisfied(pair_counts)) ||
+                    (!enforce_pair_balance && loops >= 12)) {
                     std::vector<std::pair<int, int>> normalized = chosen;
                     std::sort(normalized.begin(), normalized.end());
                     normalized.erase(std::unique(normalized.begin(), normalized.end()),
@@ -961,11 +1042,16 @@ struct Graph {
                 };
 
                 std::vector<CandidateEdge> edges;
+                std::array<int, 6> candidate_edges_by_pair{};
                 for (int pos = 0; pos < static_cast<int>(kPairs.size()); ++pos) {
                     if (((forbidden_mask >> pos) & 1ULL) != 0) {
                         continue;
                     }
                     const auto& [lhs_idx, rhs_idx] = kPairs[pos];
+                    int pair_idx = branch_pair_index(lhs_idx / 3, rhs_idx / 3);
+                    if (enforce_pair_balance && pair_counts[pair_idx] >= 2) {
+                        continue;
+                    }
                     int lhs = cur_n.children[lhs_idx / 3][lhs_idx % 3];
                     int rhs = cur_n.children[rhs_idx / 3][rhs_idx % 3];
                     if (cur_graph.participation_limit_reached(cur_n, root, lhs) ||
@@ -985,6 +1071,19 @@ struct Graph {
                                  (cur_graph.nodes[lhs].degree() +
                                   cur_graph.nodes[rhs].degree()),
                     });
+                    if (enforce_pair_balance) {
+                        ++candidate_edges_by_pair[pair_idx];
+                    }
+                }
+
+                if (enforce_pair_balance) {
+                    for (int pair_idx = 0; pair_idx < 6; ++pair_idx) {
+                        int deficit = std::max(0, 2 - pair_counts[pair_idx]);
+                        if (candidate_edges_by_pair[pair_idx] < deficit) {
+                            note_legal_edge_prune(ctx);
+                            return;
+                        }
+                    }
                 }
 
                 std::sort(edges.begin(), edges.end(), [](const CandidateEdge& lhs,
@@ -1013,8 +1112,12 @@ struct Graph {
                 for (const auto& edge : edges) {
                     legal_pairs.push_back({edge.a, edge.b});
                 }
-                if (cur_graph.max_additional_loops_exact_bound(cur_n, root, legal_pairs) <
-                    remaining_needed) {
+                const bool use_fast_bound_only = should_use_fast_bounds(ctx);
+                int additional_upper =
+                    use_fast_bound_only
+                        ? cur_graph.max_additional_loops_legal_edge_bound(cur_n, root, legal_pairs)
+                        : cur_graph.max_additional_loops_exact_bound(cur_n, root, legal_pairs);
+                if (additional_upper < remaining_needed) {
                     note_legal_edge_prune(ctx);
                     return;
                 }
@@ -1097,19 +1200,52 @@ struct Graph {
             }
         }
 
-        int loops = 0;
+        std::array<int, 6> pair_counts{};
         for (int a = 0; a < 4; ++a) {
             for (int b = a + 1; b < 4; ++b) {
+                int idx = branch_pair_index(a, b);
                 for (int i : children[a]) {
                     for (int j : children[b]) {
                         if (shared_neighbor(i, j) != -1) {
-                            ++loops;
+                            ++pair_counts[idx];
                         }
                     }
                 }
             }
         }
-        return loops;
+        return total_loops_from_pair_counts(pair_counts);
+    }
+
+    std::array<int, 6> rooted_pair_loop_counts(int root) const {
+        auto branches = neighbors(root);
+        if (static_cast<int>(branches.size()) != 4) {
+            return {-1, -1, -1, -1, -1, -1};
+        }
+
+        std::array<std::vector<int>, 4> children{};
+        for (int i = 0; i < 4; ++i) {
+            children[i] = neighbors(branches[i]);
+            children[i].erase(std::remove(children[i].begin(), children[i].end(), root),
+                              children[i].end());
+            if (static_cast<int>(children[i].size()) != 3) {
+                return {-1, -1, -1, -1, -1, -1};
+            }
+        }
+
+        std::array<int, 6> pair_counts{};
+        for (int a = 0; a < 4; ++a) {
+            for (int b = a + 1; b < 4; ++b) {
+                int idx = branch_pair_index(a, b);
+                for (int i : children[a]) {
+                    for (int j : children[b]) {
+                        if (shared_neighbor(i, j) != -1) {
+                            ++pair_counts[idx];
+                        }
+                    }
+                }
+            }
+        }
+        return pair_counts;
     }
 
     std::vector<int> distances_from(int start, int max_depth) const {
@@ -1192,9 +1328,15 @@ struct Graph {
         for (const Node& node : nodes) {
             if (node.id < dist.size() && dist[node.id] != -1 && dist[node.id] <= max_depth) {
                 int loops = rooted_loop_count(static_cast<int>(node.id));
-                if (loops != 12) {
+                std::array<int, 6> pair_counts =
+                    rooted_pair_loop_counts(static_cast<int>(node.id));
+                if (loops != 12 || !pair_balance_satisfied(pair_counts)) {
                     std::cout << "loop failure at node " << node.id
-                              << ": loops=" << loops << '\n';
+                              << ": loops=" << loops << " pair-counts=[";
+                    for (int i = 0; i < 6; ++i) {
+                        std::cout << pair_counts[i] << (i + 1 == 6 ? "" : ",");
+                    }
+                    std::cout << "]\n";
                     return false;
                 }
             }
@@ -1307,6 +1449,57 @@ std::vector<RootCandidate> generate_root_candidates(const Graph& source, int roo
             note_variant_materialized(ctx);
             append_variant(fallback, *maybe_fallback);
         }
+    } else if (source.nodes[root].role == Node::Role::branch) {
+        Graph branch = source;
+        auto maybe_branch = branch.materialize_branch_neighborhood(root);
+        if (maybe_branch) {
+            note_variant_materialized(ctx);
+            append_variant(branch, *maybe_branch);
+            if (max_results != 0 && out.size() >= max_results) {
+                return out;
+            }
+        }
+
+        Graph generic = source;
+        auto maybe_generic = generic.materialize_generic_neighborhood(root);
+        if (maybe_generic) {
+            note_variant_materialized(ctx);
+            append_variant(generic, *maybe_generic);
+            if (max_results != 0 && out.size() >= max_results) {
+                return out;
+            }
+        }
+
+        Graph fallback = source;
+        auto maybe_fallback = fallback.materialize_center_neighborhood(root);
+        if (maybe_fallback) {
+            note_variant_materialized(ctx);
+            append_variant(fallback, *maybe_fallback);
+            if (max_results != 0 && out.size() >= max_results) {
+                return out;
+            }
+        }
+    } else if (source.nodes[root].role == Node::Role::split ||
+               source.nodes[root].role == Node::Role::frontier) {
+        Graph generic = source;
+        auto maybe_generic = generic.materialize_generic_neighborhood(root);
+        if (maybe_generic) {
+            note_variant_materialized(ctx);
+            append_variant(generic, *maybe_generic);
+            if (max_results != 0 && out.size() >= max_results) {
+                return out;
+            }
+        }
+
+        Graph fallback = source;
+        auto maybe_fallback = fallback.materialize_center_neighborhood(root);
+        if (maybe_fallback) {
+            note_variant_materialized(ctx);
+            append_variant(fallback, *maybe_fallback);
+            if (max_results != 0 && out.size() >= max_results) {
+                return out;
+            }
+        }
     } else {
         Graph base = source;
         auto maybe_n = base.materialize_neighborhood(root);
@@ -1323,9 +1516,15 @@ std::vector<std::pair<int, int>> collect_legal_completion_pairs(const Graph& gra
                                                                 const Graph::Neighborhood& n,
                                                                 int root) {
     std::vector<std::pair<int, int>> legal_pairs;
+    std::array<int, 6> pair_counts = graph.rooted_pair_loop_counts(n);
+    const bool enforce_pair_balance = (graph.nodes[root].role == Node::Role::center);
     legal_pairs.reserve(54);
     for (int a = 0; a < 4; ++a) {
         for (int b = a + 1; b < 4; ++b) {
+            int pair_idx = Graph::branch_pair_index(a, b);
+            if (enforce_pair_balance && pair_counts[pair_idx] >= 2) {
+                continue;
+            }
             for (int i = 0; i < 3; ++i) {
                 for (int j = 0; j < 3; ++j) {
                     int lhs = n.children[a][i];
@@ -1348,13 +1547,48 @@ std::vector<std::pair<int, int>> collect_legal_completion_pairs(const Graph& gra
     return legal_pairs;
 }
 
-RootGenerationEstimate analyze_root_generation(const Graph& graph, int root) {
+std::array<int, 6> legal_completion_pair_capacity(const Graph& graph,
+                                                  const Graph::Neighborhood& n, int root) {
+    std::array<int, 6> capacity{};
+    std::array<int, 6> pair_counts = graph.rooted_pair_loop_counts(n);
+    const bool enforce_pair_balance = (graph.nodes[root].role == Node::Role::center);
+    for (int a = 0; a < 4; ++a) {
+        for (int b = a + 1; b < 4; ++b) {
+            int pair_idx = Graph::branch_pair_index(a, b);
+            if (enforce_pair_balance && pair_counts[pair_idx] >= 2) {
+                continue;
+            }
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    int lhs = n.children[a][i];
+                    int rhs = n.children[b][j];
+                    if (graph.participation_limit_reached(n, root, lhs) ||
+                        graph.participation_limit_reached(n, root, rhs)) {
+                        continue;
+                    }
+                    if (graph.shared_neighbor(lhs, rhs) != -1 ||
+                        !graph.can_split_with_new_node(lhs, rhs)) {
+                        continue;
+                    }
+                    ++capacity[pair_idx];
+                }
+            }
+        }
+    }
+    return capacity;
+}
+
+RootGenerationEstimate analyze_root_generation(const Graph& graph, int root,
+                                               SearchContext* ctx) {
     std::uint64_t variant_count = 0;
     int best_upper_bound = std::numeric_limits<int>::max();
     int worst_upper_bound = std::numeric_limits<int>::min();
     int best_slack = std::numeric_limits<int>::max();
 
     auto consider_variant = [&](Graph& base, const Graph::Neighborhood& n) {
+        if (is_search_timed_out(ctx)) {
+            return;
+        }
         ++variant_count;
         CompletionFingerprint fp = base.completion_fingerprint(root, n);
         int upper_bound = 0;
@@ -1362,10 +1596,28 @@ RootGenerationEstimate analyze_root_generation(const Graph& graph, int root) {
         if (it != g_variant_upper_bound_cache.end()) {
             upper_bound = it->second;
         } else {
-            int loops = base.rooted_loop_count(root);
-            std::vector<std::pair<int, int>> legal_pairs =
-                collect_legal_completion_pairs(base, n, root);
-            upper_bound = loops + base.max_additional_loops_exact_bound(n, root, legal_pairs);
+            std::array<int, 6> pair_counts = base.rooted_pair_loop_counts(n);
+            const bool enforce_pair_balance = (base.nodes[root].role == Node::Role::center);
+            if (enforce_pair_balance && !base.pair_balance_feasible(pair_counts)) {
+                upper_bound = -1;
+            } else {
+                int loops = Graph::total_loops_from_pair_counts(pair_counts);
+                std::vector<std::pair<int, int>> legal_pairs =
+                    collect_legal_completion_pairs(base, n, root);
+                int global_upper = loops + base.max_additional_loops_exact_bound(n, root, legal_pairs);
+
+                int pair_upper = global_upper;
+                if (enforce_pair_balance) {
+                    std::array<int, 6> pair_legal_capacity =
+                        legal_completion_pair_capacity(base, n, root);
+                    pair_upper = 0;
+                    for (int pair_idx = 0; pair_idx < 6; ++pair_idx) {
+                        pair_upper +=
+                            std::min(2, pair_counts[pair_idx] + pair_legal_capacity[pair_idx]);
+                    }
+                }
+                upper_bound = std::min(global_upper, pair_upper);
+            }
             g_variant_upper_bound_cache.emplace(fp, upper_bound);
         }
         worst_upper_bound = std::max(worst_upper_bound, upper_bound);
@@ -1402,6 +1654,9 @@ RootGenerationEstimate analyze_root_generation(const Graph& graph, int root) {
                 for (int split_b = split_a + 1; split_b < split_choice_count; ++split_b) {
                     for (int outward_choice = 0; outward_choice < outward_choice_count;
                          ++outward_choice) {
+                        if (is_search_timed_out(ctx)) {
+                            return RootGenerationEstimate{};
+                        }
                         Graph base = graph;
                         auto maybe_n = base.materialize_leaf_neighborhood_with_choices(
                             root, branch_choice, {split_a, split_b}, outward_choice);
@@ -1420,6 +1675,43 @@ RootGenerationEstimate analyze_root_generation(const Graph& graph, int root) {
         Graph generic = graph;
         auto maybe_generic = generic.materialize_generic_neighborhood(root);
         if (maybe_generic && seen_branch_assignments.insert(maybe_generic->branches).second) {
+            consider_variant(generic, *maybe_generic);
+        }
+
+        Graph fallback = graph;
+        auto maybe_fallback = fallback.materialize_center_neighborhood(root);
+        if (maybe_fallback) {
+            consider_variant(fallback, *maybe_fallback);
+        }
+    } else if (graph.nodes[root].role == Node::Role::branch) {
+        if (is_search_timed_out(ctx)) {
+            return RootGenerationEstimate{};
+        }
+        Graph branch = graph;
+        auto maybe_branch = branch.materialize_branch_neighborhood(root);
+        if (maybe_branch) {
+            consider_variant(branch, *maybe_branch);
+        }
+
+        Graph generic = graph;
+        auto maybe_generic = generic.materialize_generic_neighborhood(root);
+        if (maybe_generic) {
+            consider_variant(generic, *maybe_generic);
+        }
+
+        Graph fallback = graph;
+        auto maybe_fallback = fallback.materialize_center_neighborhood(root);
+        if (maybe_fallback) {
+            consider_variant(fallback, *maybe_fallback);
+        }
+    } else if (graph.nodes[root].role == Node::Role::split ||
+               graph.nodes[root].role == Node::Role::frontier) {
+        if (is_search_timed_out(ctx)) {
+            return RootGenerationEstimate{};
+        }
+        Graph generic = graph;
+        auto maybe_generic = generic.materialize_generic_neighborhood(root);
+        if (maybe_generic) {
             consider_variant(generic, *maybe_generic);
         }
 
@@ -1589,6 +1881,7 @@ struct SearchContext {
     std::uint64_t split_apply_failures = 0;
     std::uint64_t solutions_checked = 0;
     std::uint64_t progress_interval_states = 1000;
+    double per_seed_time_limit_seconds = 0.0;
     int target_depth = 0;
     int active_root = -1;
     int active_generation_depth = -1;
@@ -1598,6 +1891,8 @@ struct SearchContext {
     std::vector<std::uint64_t> dead_ends_by_depth;
     std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point last_report_time = start_time;
+    bool time_limit_hit = false;
+    bool time_limit_reported = false;
 
     void ensure_depth_slot(int depth) {
         if (depth >= static_cast<int>(states_by_depth.size())) {
@@ -1676,7 +1971,38 @@ struct SearchContext {
         report_progress(reason ? reason : "root-gen-tick", active_generation_depth,
                         visited.size(), active_generation_todo, active_generation_nodes);
     }
+
+    bool timed_out() {
+        if (time_limit_hit) {
+            return true;
+        }
+        if (per_seed_time_limit_seconds <= 0.0) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+        if (elapsed_s >= per_seed_time_limit_seconds) {
+            time_limit_hit = true;
+            return true;
+        }
+        return false;
+    }
 };
+
+bool is_search_timed_out(SearchContext* ctx) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->timed_out();
+}
+
+bool should_use_fast_bounds(SearchContext* ctx) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->per_seed_time_limit_seconds > 0.0;
+}
 
 void note_local_cache_hit(SearchContext* ctx) {
     if (!ctx) {
@@ -1793,6 +2119,14 @@ bool enqueue_neighbors(SearchState& state, int root, int depth, int max_depth) {
 }
 
 bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int max_depth) {
+    if (ctx.timed_out()) {
+        if (!ctx.time_limit_reported) {
+            ctx.report_progress("seed-time-limit", -1, ctx.visited.size(), state.todo.size(),
+                                state.graph.nodes.size());
+            ctx.time_limit_reported = true;
+        }
+        return false;
+    }
     SearchState cur = state;
     while (!cur.todo.empty() && cur.completed[cur.todo.front().first]) {
         cur.todo.pop_front();
@@ -1826,7 +2160,7 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
 
     for (int i = 0; i < static_cast<int>(cur.todo.size()); ++i) {
         auto [root, depth] = cur.todo[i];
-        RootGenerationEstimate estimate = analyze_root_generation(cur.graph, root);
+        RootGenerationEstimate estimate = analyze_root_generation(cur.graph, root, &ctx);
         if (chosen_index == -1 || estimate.order_cost < best_estimate ||
             (estimate.order_cost == best_estimate && depth < chosen_depth) ||
             (estimate.order_cost == best_estimate && depth == chosen_depth && root < chosen_root)) {
@@ -1903,7 +2237,7 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
                 next.completed[pending_root]) {
                 continue;
             }
-            if (!analyze_root_generation(next.graph, pending_root).any_feasible_variant) {
+            if (!analyze_root_generation(next.graph, pending_root, &ctx).any_feasible_variant) {
                 impossible_pending_root = true;
                 break;
             }
@@ -1952,50 +2286,173 @@ Graph build_seed() {
     return g;
 }
 
+Graph build_minimal_seed() {
+    Graph g;
+    int root = g.add_node(Node::Role::center);
+    auto maybe_n = g.materialize_neighborhood(root);
+    if (!maybe_n) {
+        return g;
+    }
+    return g;
+}
+
+Graph build_pair_balanced_seed() {
+    Graph g = build_minimal_seed();
+    auto maybe_n = g.materialize_neighborhood(0);
+    if (!maybe_n) {
+        return g;
+    }
+    Graph::Neighborhood n = *maybe_n;
+
+    while (true) {
+        std::array<int, 6> pair_counts = g.rooted_pair_loop_counts(n);
+        if (g.pair_balance_satisfied(pair_counts) || !g.pair_balance_feasible(pair_counts)) {
+            break;
+        }
+
+        bool added = false;
+        for (int a = 0; a < 4 && !added; ++a) {
+            for (int b = a + 1; b < 4 && !added; ++b) {
+                int pair_idx = Graph::branch_pair_index(a, b);
+                if (pair_counts[pair_idx] >= 2) {
+                    continue;
+                }
+                for (int i = 0; i < 3 && !added; ++i) {
+                    for (int j = 0; j < 3 && !added; ++j) {
+                        int lhs = n.children[a][i];
+                        int rhs = n.children[b][j];
+                        if (g.shared_neighbor(lhs, rhs) != -1) {
+                            continue;
+                        }
+                        if (g.ensure_split(lhs, rhs) != -1) {
+                            added = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!added) {
+            break;
+        }
+    }
+    return g;
+}
+
+std::vector<Graph> build_pair_balanced_seed_exhaustive(std::size_t max_results = 0) {
+    Graph base = build_minimal_seed();
+    auto maybe_n = base.materialize_neighborhood(0);
+    if (!maybe_n) {
+        return {base};
+    }
+
+    std::vector<Graph::CompletionPlan> plans =
+        base.generate_completion_candidates_for_materialized(0, *maybe_n, nullptr, max_results);
+
+    std::vector<Graph> out;
+    out.reserve(plans.size());
+    for (const auto& plan : plans) {
+        Graph g = base;
+        bool ok = true;
+        for (const auto& [a, b] : plan.add_pairs) {
+            if (g.ensure_split(a, b) == -1) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            out.push_back(std::move(g));
+        }
+    }
+    if (out.empty()) {
+        out.push_back(build_pair_balanced_seed());
+    }
+    return out;
+}
+
 int main() {
     std::cout << std::unitbuf;
 
-    constexpr int kMaxDepth = 4;
+    constexpr int kDefaultMaxDepth = 2;
     constexpr std::size_t kDefaultCacheReserve = 1'000'000;
     constexpr std::uint64_t kDefaultProgressIntervalStates = 10'000;
+    constexpr double kDefaultSeedTimeLimitSeconds = 0.0;
+    constexpr std::size_t kDefaultExhaustiveSeedLimit = 0;
+    int max_depth = kDefaultMaxDepth;
     std::size_t cache_reserve = kDefaultCacheReserve;
     std::uint64_t progress_interval_states = kDefaultProgressIntervalStates;
+    double seed_time_limit_seconds = kDefaultSeedTimeLimitSeconds;
+    std::size_t exhaustive_seed_limit = kDefaultExhaustiveSeedLimit;
+    if (const char* max_depth_env = std::getenv("HEX_MAX_DEPTH")) {
+        max_depth = std::max(0, static_cast<int>(std::strtol(max_depth_env, nullptr, 10)));
+    }
     if (const char* reserve_env = std::getenv("HEX_CACHE_RESERVE_STATES")) {
         cache_reserve = std::max<std::size_t>(1, std::strtoull(reserve_env, nullptr, 10));
     }
     if (const char* interval_env = std::getenv("HEX_PROGRESS_INTERVAL_STATES")) {
         progress_interval_states = std::max<std::uint64_t>(1, std::strtoull(interval_env, nullptr, 10));
     }
+    if (const char* seed_limit_env = std::getenv("HEX_SEED_TIME_LIMIT_SECONDS")) {
+        seed_time_limit_seconds = std::max(0.0, std::strtod(seed_limit_env, nullptr));
+    }
+    if (const char* exhaustive_seed_limit_env = std::getenv("HEX_EXHAUSTIVE_SEED_LIMIT")) {
+        exhaustive_seed_limit = std::strtoull(exhaustive_seed_limit_env, nullptr, 10);
+    }
 
     std::cout << "transposition cache reserved for ~" << cache_reserve
               << " states in RAM"
-              << ", progress interval=" << progress_interval_states << " states\n";
+              << ", progress interval=" << progress_interval_states << " states"
+              << ", per-seed-time-limit=" << seed_time_limit_seconds << "s"
+              << ", max-depth=" << max_depth
+              << ", exhaustive-seed-limit=" << exhaustive_seed_limit << '\n';
 
-    for (int depth = 0; depth <= kMaxDepth; ++depth) {
-        SearchContext ctx;
-        ctx.visited.max_load_factor(0.7f);
-        ctx.visited.reserve(cache_reserve);
-        ctx.progress_interval_states = progress_interval_states;
-        ctx.target_depth = depth;
-        ctx.start_time = std::chrono::steady_clock::now();
-        ctx.last_report_time = ctx.start_time;
+    for (int depth = 0; depth <= max_depth; ++depth) {
+        std::vector<std::pair<std::string, Graph>> seed_variants;
+        std::vector<Graph> exhaustive_pair_balanced =
+            build_pair_balanced_seed_exhaustive(exhaustive_seed_limit);
+        for (std::size_t i = 0; i < exhaustive_pair_balanced.size(); ++i) {
+            seed_variants.push_back({"pair-balanced-exhaustive-" + std::to_string(i),
+                                     exhaustive_pair_balanced[i]});
+        }
+        seed_variants.push_back({"image-seed", build_seed()});
+        seed_variants.push_back({"minimal-seed", build_minimal_seed()});
 
-        SearchState initial;
-        initial.graph = build_seed();
-        initial.depth_seen.resize(initial.graph.nodes.size(), -1);
-        initial.completed.resize(initial.graph.nodes.size(), false);
-        initial.depth_seen[0] = 0;
-        initial.todo.push_back({0, 0});
+        bool depth_ok = false;
+        for (const auto& [seed_name, seed_graph] : seed_variants) {
+            SearchContext ctx;
+            ctx.visited.max_load_factor(0.7f);
+            ctx.visited.reserve(cache_reserve);
+            ctx.progress_interval_states = progress_interval_states;
+            ctx.per_seed_time_limit_seconds = seed_time_limit_seconds;
+            ctx.target_depth = depth;
+            ctx.start_time = std::chrono::steady_clock::now();
+            ctx.last_report_time = ctx.start_time;
 
-        if (!expand_with_backtracking(ctx, initial, depth)) {
-            ctx.report_progress("depth-failed", -1, ctx.visited.size(), initial.todo.size(),
-                                initial.graph.nodes.size());
+            SearchState initial;
+            initial.graph = seed_graph;
+            initial.depth_seen.resize(initial.graph.nodes.size(), -1);
+            initial.completed.resize(initial.graph.nodes.size(), false);
+            initial.depth_seen[0] = 0;
+            initial.todo.push_back({0, 0});
+
+            if (expand_with_backtracking(ctx, initial, depth)) {
+                std::cout << "depth " << depth << " solved with " << seed_name << '\n';
+                ctx.report_progress("depth-complete", -1, ctx.visited.size(), 0,
+                                    initial.graph.nodes.size());
+                std::cout << "validated depth " << depth
+                          << " with cache size=" << ctx.visited.size() << '\n';
+                depth_ok = true;
+                break;
+            }
+            if (ctx.time_limit_hit) {
+                std::cout << "seed " << seed_name << " hit time limit at depth " << depth
+                          << '\n';
+            }
+        }
+
+        if (!depth_ok) {
             std::cout << "failed to validate depth " << depth << '\n';
             return 1;
         }
-        ctx.report_progress("depth-complete", -1, ctx.visited.size(), 0, initial.graph.nodes.size());
-        std::cout << "validated depth " << depth
-                  << " with cache size=" << ctx.visited.size() << '\n';
     }
     return 0;
 }
