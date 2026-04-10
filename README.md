@@ -7,7 +7,10 @@ Constraints
 
 - every node must have degree 4
 - no cycle shorter than 6
-- every chosen root should see 12 cycles of length 6
+- every chosen root should see 12 cycles of length 6, distributed evenly across
+  its logical connection pairs
+- for a degree-4 root, its 4 incident connections define 6 unordered pairs, and
+  each such pair should participate in exactly 2 rooted 6-cycles
 
 Files
 
@@ -57,6 +60,9 @@ Current status
 
 - Depth 0 and depth 1 validate.
 - Depth 2 still fails under the current neighborhood/completion model.
+- The current solver does not yet enforce the stronger pair-balance form of the
+  rooted-cycle constraint. It checks aggregate rooted 6-cycle counts, not
+  whether each of the 6 logical connection pairs contributes exactly 2 cycles.
 - The solver is now much closer to exhausting the modeled depth-2 search space
   rather than timing out in obvious search-order pathologies.
 - The recurring failure is still local-root completion failure, but the exact
