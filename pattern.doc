@@ -1,0 +1,120 @@
+Pattern topology from the drawing
+
+Model constraints
+
+1. Every node must have exactly 4 connections to other nodes.
+
+2. The graph girth must be at least 6.
+That means there are no closed loops anywhere in the graph with fewer than 6
+connections.
+
+3. Taking any node as the current root, the graph should expose 12 distinct
+loops of length 6 from that root.
+Equivalently, around each chosen root there must be 12 six-connection cycles in
+the graph.
+
+Expansion model
+
+The program now treats the drawn pattern as a seed neighborhood and then grows
+the graph by root shifts.
+
+1. Build the exact image pattern once around the initial root.
+
+2. When the root shifts onto an already discovered node, traverse its current
+neighbors and reuse the existing part of the local two-level neighborhood.
+
+3. If the shifted root is missing first-level or second-level nodes, create the
+missing nodes off the current frontier.
+
+4. Count the already existing 6-connection loops visible from that shifted root.
+
+5. Add only the missing split nodes between second-level nodes from different
+branches until the shifted root has 12 loops of length 6, while preserving the
+minimum cycle length of 6 and never exceeding degree 4 on any node.
+
+6. Newly created frontier nodes may be temporarily under-connected until a later
+shift expands around them. The completion pass is what brings a chosen local
+neighborhood up to the model constraints.
+
+Typed expansion model
+
+The current implementation no longer assumes that every shifted root can be
+completed with the same local rule.
+
+It now distinguishes several node roles:
+
+- center: the 4-way hub type used by the original seed root
+- branch: a node with one center-side neighbor and three leaf-side neighbors
+- leaf: a node between a branch-side neighbor, split-side neighbors, and outward
+  frontier structure
+- split: a node that sits on a loop bridge between two leaf-side regions
+- frontier: newly created outward nodes that are not yet fully specialized
+
+Completion is role-specific:
+
+- center roots use the original image seed pattern and local pairing planner
+- branch roots use a separate neighborhood shape and branch-specific loop filler
+- leaf, split, and frontier nodes are still incomplete in the current model and
+  remain the active refinement area for deeper expansion
+
+Node sets
+
+Blue nodes:
+n0
+n1, n2, n3, n4
+n1.1, n1.2, n1.3
+n2.1, n2.2, n2.3
+n3.1, n3.2, n3.3
+n4.1, n4.2, n4.3
+
+Outer connector nodes:
+o1..o12
+
+Blue rooted tree
+
+n0 -> n1, n2, n3, n4
+
+n1 -> n0, n1.1, n1.2, n1.3
+n2 -> n0, n2.1, n2.2, n2.3
+n3 -> n0, n3.1, n3.2, n3.3
+n4 -> n0, n4.1, n4.2, n4.3
+
+Numbered outer split connections from the image
+
+o1  splits n1.1 - n2.1
+o2  splits n2.1 - n3.1
+o3  splits n3.1 - n4.1
+o4  splits n1.2 - n4.3
+o5  splits n1.2 - n4.1
+o6  splits n3.2 - n4.2
+o7  splits n2.2 - n4.2
+o8  splits n2.2 - n3.3
+o9  splits n1.3 - n3.3
+o10 splits n1.3 - n2.3
+o11 splits n2.3 - n3.2
+o12 splits n1.1 - n4.3
+
+Blue node degrees in this interpretation
+
+n0, n1, n2, n3, n4 have degree 4 from the rooted tree.
+Each leaf nX.Y has degree 4 total: one tree edge to its parent and two edges to
+one outer connector on each of its two red connections.
+Each outer connector oK has degree 2.
+
+Leaf participation by number
+
+n1.1 -> 1, 12
+n1.2 -> 4, 5
+n1.3 -> 9, 10
+
+n2.1 -> 1, 2
+n2.2 -> 7, 8
+n2.3 -> 10, 11
+
+n3.1 -> 2, 3
+n3.2 -> 6, 11
+n3.3 -> 8, 9
+
+n4.1 -> 3, 5
+n4.2 -> 6, 7
+n4.3 -> 4, 12
