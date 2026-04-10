@@ -1,11 +1,18 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <deque>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <optional>
 #include <queue>
 #include <set>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -45,6 +52,74 @@ struct Node {
             }
         }
         return false;
+    }
+};
+
+struct SearchContext;
+struct Graph;
+void note_local_cache_hit(SearchContext* ctx);
+void note_local_completion_state(SearchContext* ctx);
+void note_generation_progress(SearchContext* ctx, const char* reason);
+void note_root_candidate_call(SearchContext* ctx);
+void note_variant_attempt(SearchContext* ctx);
+void note_variant_materialized(SearchContext* ctx);
+void note_capacity_prune(SearchContext* ctx);
+void note_legal_edge_prune(SearchContext* ctx);
+void note_dead_root_cache_hit(SearchContext* ctx);
+void note_impossible_root_prune(SearchContext* ctx);
+struct RootGenerationEstimate {
+    std::uint64_t order_cost = 0;
+    bool any_feasible_variant = false;
+};
+
+RootGenerationEstimate analyze_root_generation(const Graph& graph, int root);
+
+struct CompletionFingerprint {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+
+    bool operator==(const CompletionFingerprint& other) const {
+        return lo == other.lo && hi == other.hi;
+    }
+};
+
+struct LocalBoundKey {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+
+    bool operator==(const LocalBoundKey& other) const {
+        return lo == other.lo && hi == other.hi;
+    }
+};
+
+struct LocalBoundKeyHasher {
+    std::size_t operator()(const LocalBoundKey& value) const {
+        return static_cast<std::size_t>(value.lo ^ (value.hi * 0x94d049bb133111ebULL));
+    }
+};
+
+struct CompletionFingerprintHasher {
+    std::size_t operator()(const CompletionFingerprint& value) const {
+        return static_cast<std::size_t>(value.lo ^ (value.hi * 0x517cc1b727220a95ULL));
+    }
+};
+
+static std::unordered_map<CompletionFingerprint, int, CompletionFingerprintHasher>
+    g_variant_upper_bound_cache;
+
+bool has_dead_root_cache(SearchContext* ctx, const CompletionFingerprint& fp);
+void remember_dead_root_cache(SearchContext* ctx, const CompletionFingerprint& fp);
+
+struct FingerprintBuilder {
+    std::uint64_t lo = 1469598103934665603ULL;
+    std::uint64_t hi = 1099511628211ULL;
+
+    void mix(std::uint64_t value) {
+        lo ^= value + 0x9e3779b97f4a7c15ULL + (lo << 6) + (lo >> 2);
+        lo *= 1099511628211ULL;
+        hi += value + 0x9e3779b97f4a7c15ULL + (hi << 6) + (hi >> 2);
+        hi ^= (value << 17) | (value >> 47);
+        hi *= 14029467366897019727ULL;
     }
 };
 
@@ -278,7 +353,34 @@ struct Graph {
         return n;
     }
 
-    std::optional<Neighborhood> materialize_leaf_neighborhood(int root) {
+    std::optional<Neighborhood> materialize_generic_neighborhood(int root) {
+        Neighborhood n{};
+        auto branches = ensure_neighbors(root, kBranchCount, -1, Node::Role::frontier);
+        if (static_cast<int>(branches.size()) != kBranchCount) {
+            return std::nullopt;
+        }
+
+        for (int i = 0; i < kBranchCount; ++i) {
+            n.branches[i] = branches[i];
+        }
+
+        for (int i = 0; i < kBranchCount; ++i) {
+            auto kids = ensure_neighbors(n.branches[i], kChildrenPerBranch, root, Node::Role::frontier);
+            kids.erase(std::remove(kids.begin(), kids.end(), root), kids.end());
+            std::sort(kids.begin(), kids.end());
+            if (static_cast<int>(kids.size()) < kChildrenPerBranch) {
+                return std::nullopt;
+            }
+            for (int j = 0; j < kChildrenPerBranch; ++j) {
+                n.children[i][j] = kids[j];
+            }
+        }
+
+        return n;
+    }
+
+    std::optional<Neighborhood> materialize_leaf_neighborhood_with_choices(
+        int root, int branch_choice, std::array<int, 2> split_choices, int outward_choice) {
         Neighborhood n{};
         std::vector<int> branch_side;
         std::vector<int> split_side;
@@ -323,11 +425,24 @@ struct Graph {
             return std::nullopt;
         }
 
-        n.branches[0] = branch_side.front();
+        if (branch_choice < 0 || branch_choice >= static_cast<int>(branch_side.size())) {
+            return std::nullopt;
+        }
+        if (split_choices[0] < 0 || split_choices[1] < 0 ||
+            split_choices[0] >= static_cast<int>(split_side.size()) ||
+            split_choices[1] >= static_cast<int>(split_side.size()) ||
+            split_choices[0] == split_choices[1]) {
+            return std::nullopt;
+        }
+        if (outward_choice < 0 || outward_choice >= static_cast<int>(outward_side.size())) {
+            return std::nullopt;
+        }
+
+        n.branches[0] = branch_side[branch_choice];
 
         std::array<int, 2> split_parent{-1, -1};
         for (int i = 0; i < 2; ++i) {
-            int split = split_side[i];
+            int split = split_side[split_choices[i]];
             int opposite = -1;
             for (int nb : neighbors(split)) {
                 if (nb != root) {
@@ -345,7 +460,7 @@ struct Graph {
             n.branches[i + 1] = opposite;
             split_parent[i] = split;
         }
-        n.branches[3] = outward_side.front();
+        n.branches[3] = outward_side[outward_choice];
 
         auto fill_children = [&](int slot, int branch_node, int exclude,
                                  Node::Role role) -> bool {
@@ -377,6 +492,10 @@ struct Graph {
         return n;
     }
 
+    std::optional<Neighborhood> materialize_leaf_neighborhood(int root) {
+        return materialize_leaf_neighborhood_with_choices(root, 0, {0, 1}, 0);
+    }
+
     std::optional<Neighborhood> materialize_neighborhood(int root) {
         if (nodes[root].role == Node::Role::branch) {
             return materialize_branch_neighborhood(root);
@@ -385,6 +504,14 @@ struct Graph {
             auto leaf_n = materialize_leaf_neighborhood(root);
             if (leaf_n && (rooted_loop_count(*leaf_n) >= 12 || has_completion_move(*leaf_n))) {
                 return leaf_n;
+            }
+            return materialize_center_neighborhood(root);
+        }
+        if (nodes[root].role == Node::Role::split || nodes[root].role == Node::Role::frontier) {
+            auto generic_n = materialize_generic_neighborhood(root);
+            if (generic_n && (rooted_loop_count(*generic_n) >= 12 ||
+                              has_completion_move(*generic_n))) {
+                return generic_n;
             }
             return materialize_center_neighborhood(root);
         }
@@ -425,6 +552,35 @@ struct Graph {
         return loops;
     }
 
+    CompletionFingerprint completion_fingerprint(int root, const Neighborhood& n) const {
+        std::array<int, 12> flat{};
+        for (int a = 0; a < 4; ++a) {
+            for (int i = 0; i < 3; ++i) {
+                flat[a * 3 + i] = n.children[a][i];
+            }
+        }
+
+        FingerprintBuilder builder;
+        builder.mix(static_cast<std::uint64_t>(static_cast<int>(nodes[root].role)));
+        for (int idx : flat) {
+            builder.mix(static_cast<std::uint64_t>(static_cast<int>(nodes[idx].role)));
+            builder.mix(static_cast<std::uint64_t>(nodes[idx].degree()));
+            builder.mix(static_cast<std::uint64_t>(nodes[idx].free_slots()));
+        }
+        for (int lhs = 0; lhs < 12; ++lhs) {
+            for (int rhs = lhs + 1; rhs < 12; ++rhs) {
+                if (lhs / 3 == rhs / 3) {
+                    continue;
+                }
+                int a = flat[lhs];
+                int b = flat[rhs];
+                builder.mix(static_cast<std::uint64_t>(shared_neighbor(a, b) != -1));
+                builder.mix(static_cast<std::uint64_t>(can_split_with_new_node(a, b)));
+            }
+        }
+        return CompletionFingerprint{.lo = builder.lo, .hi = builder.hi};
+    }
+
     int rooted_participation_count(const Neighborhood& n, int child) const {
         int count = 0;
         for (int a = 0; a < 4; ++a) {
@@ -446,6 +602,187 @@ struct Graph {
         return count;
     }
 
+    bool participation_limit_reached(const Neighborhood& n, int root, int child) const {
+        if (nodes[root].role == Node::Role::leaf) {
+            return false;
+        }
+        return rooted_participation_count(n, child) >= 2;
+    }
+
+    int participation_capacity_left(const Neighborhood& n, int root, int child) const {
+        if (nodes[root].role == Node::Role::leaf) {
+            return nodes[child].free_slots();
+        }
+        return std::min(nodes[child].free_slots(), 2 - rooted_participation_count(n, child));
+    }
+
+    int max_additional_loops_capacity_bound(const Neighborhood& n, int root) const {
+        int total_capacity = 0;
+        for (int a = 0; a < 4; ++a) {
+            for (int i = 0; i < 3; ++i) {
+                total_capacity += std::max(0, participation_capacity_left(n, root, n.children[a][i]));
+            }
+        }
+        return total_capacity / 2;
+    }
+
+    int max_additional_loops_legal_edge_bound(
+        const Neighborhood& n, int root,
+        const std::vector<std::pair<int, int>>& legal_edges) const {
+        std::array<int, 12> flat{};
+        std::array<int, 12> capacities{};
+        std::unordered_map<int, int> index_by_child;
+        index_by_child.reserve(12);
+
+        for (int a = 0; a < 4; ++a) {
+            for (int i = 0; i < 3; ++i) {
+                int idx = a * 3 + i;
+                int child = n.children[a][i];
+                flat[idx] = child;
+                capacities[idx] = std::max(0, participation_capacity_left(n, root, child));
+                index_by_child.emplace(child, idx);
+            }
+        }
+
+        std::array<int, 12> incident_counts{};
+        for (const auto& [a, b] : legal_edges) {
+            auto ita = index_by_child.find(a);
+            auto itb = index_by_child.find(b);
+            if (ita == index_by_child.end() || itb == index_by_child.end()) {
+                continue;
+            }
+            ++incident_counts[ita->second];
+            ++incident_counts[itb->second];
+        }
+
+        int total_usable_capacity = 0;
+        for (int idx = 0; idx < 12; ++idx) {
+            total_usable_capacity += std::min(capacities[idx], incident_counts[idx]);
+        }
+        return total_usable_capacity / 2;
+    }
+
+    static constexpr std::array<std::pair<int, int>, 54> child_pair_positions() {
+        std::array<std::pair<int, int>, 54> pairs{};
+        int pos = 0;
+        for (int a = 0; a < 12; ++a) {
+            for (int b = a + 1; b < 12; ++b) {
+                if (a / 3 == b / 3) {
+                    continue;
+                }
+                pairs[pos++] = {a, b};
+            }
+        }
+        return pairs;
+    }
+
+    static LocalBoundKey pack_local_bound_key(const std::array<int, 12>& capacities,
+                                              std::uint64_t edge_mask) {
+        std::uint64_t lo = edge_mask;
+        std::uint64_t hi = 0;
+        for (int i = 0; i < 12; ++i) {
+            hi |= (static_cast<std::uint64_t>(capacities[i] & 0xf) << (i * 4));
+        }
+        return LocalBoundKey{.lo = lo, .hi = hi};
+    }
+
+    int max_additional_loops_exact_bound(
+        const Neighborhood& n, int root,
+        const std::vector<std::pair<int, int>>& legal_edges) const {
+        static constexpr auto kPairs = child_pair_positions();
+
+        std::array<int, 12> capacities{};
+        std::unordered_map<int, int> index_by_child;
+        index_by_child.reserve(12);
+        for (int a = 0; a < 4; ++a) {
+            for (int i = 0; i < 3; ++i) {
+                int idx = a * 3 + i;
+                int child = n.children[a][i];
+                capacities[idx] = std::max(0, participation_capacity_left(n, root, child));
+                index_by_child.emplace(child, idx);
+            }
+        }
+
+        std::uint64_t edge_mask = 0;
+        for (const auto& [lhs_child, rhs_child] : legal_edges) {
+            auto it_lhs = index_by_child.find(lhs_child);
+            auto it_rhs = index_by_child.find(rhs_child);
+            if (it_lhs == index_by_child.end() || it_rhs == index_by_child.end()) {
+                continue;
+            }
+            int lhs = std::min(it_lhs->second, it_rhs->second);
+            int rhs = std::max(it_lhs->second, it_rhs->second);
+            for (int pos = 0; pos < static_cast<int>(kPairs.size()); ++pos) {
+                if (kPairs[pos].first == lhs && kPairs[pos].second == rhs) {
+                    edge_mask |= (1ULL << pos);
+                    break;
+                }
+            }
+        }
+
+        std::unordered_map<LocalBoundKey, int, LocalBoundKeyHasher> memo;
+        memo.reserve(1 << 14);
+
+        auto dfs = [&](auto&& self, std::array<int, 12> cur_caps,
+                       std::uint64_t cur_mask) -> int {
+            if (cur_mask == 0) {
+                return 0;
+            }
+
+            LocalBoundKey key = pack_local_bound_key(cur_caps, cur_mask);
+            auto it = memo.find(key);
+            if (it != memo.end()) {
+                return it->second;
+            }
+
+            int best_pos = -1;
+            int best_score = 1000;
+            for (int pos = 0; pos < static_cast<int>(kPairs.size()); ++pos) {
+                if (((cur_mask >> pos) & 1ULL) == 0) {
+                    continue;
+                }
+                const auto& [u, v] = kPairs[pos];
+                if (cur_caps[u] <= 0 || cur_caps[v] <= 0) {
+                    continue;
+                }
+                int score = cur_caps[u] + cur_caps[v];
+                if (score < best_score) {
+                    best_score = score;
+                    best_pos = pos;
+                }
+            }
+
+            if (best_pos == -1) {
+                memo.emplace(key, 0);
+                return 0;
+            }
+
+            const auto& [u, v] = kPairs[best_pos];
+            int best = self(self, cur_caps, cur_mask & ~(1ULL << best_pos));
+
+            std::array<int, 12> next_caps = cur_caps;
+            --next_caps[u];
+            --next_caps[v];
+            std::uint64_t next_mask = cur_mask & ~(1ULL << best_pos);
+            for (int pos = 0; pos < static_cast<int>(kPairs.size()); ++pos) {
+                if (((next_mask >> pos) & 1ULL) == 0) {
+                    continue;
+                }
+                const auto& [a, b] = kPairs[pos];
+                if ((a == u && next_caps[u] == 0) || (b == u && next_caps[u] == 0) ||
+                    (a == v && next_caps[v] == 0) || (b == v && next_caps[v] == 0)) {
+                    next_mask &= ~(1ULL << pos);
+                }
+            }
+            best = std::max(best, 1 + self(self, next_caps, next_mask));
+
+            memo.emplace(key, best);
+            return best;
+        };
+
+        return dfs(dfs, capacities, edge_mask);
+    }
+
     bool has_completion_move(const Neighborhood& n) const {
         for (int a = 0; a < 4; ++a) {
             for (int b = a + 1; b < 4; ++b) {
@@ -464,22 +801,21 @@ struct Graph {
         return false;
     }
 
-    std::vector<CompletionPlan> generate_completion_candidates(int root, int max_results) const {
-
-        Graph base = *this;
-        auto maybe_n = base.materialize_neighborhood(root);
-        if (!maybe_n) {
-            return {};
-        }
-        const Neighborhood& n = *maybe_n;
-
-        if (base.rooted_loop_count(root) >= 12) {
-            return {CompletionPlan{}};
+    std::vector<CompletionPlan> generate_completion_candidates_for_materialized(
+        int root, const Neighborhood& n, SearchContext* ctx = nullptr,
+        std::size_t max_results = 0,
+        const std::vector<std::pair<int, int>>* pending_roots = nullptr,
+        int max_depth = -1) const {
+        std::set<std::vector<std::pair<int, int>>> seen;
+        std::vector<CompletionPlan> out;
+        if (rooted_loop_count(root) >= 12) {
+            out.push_back(CompletionPlan{});
+            return out;
         }
 
         std::optional<CompletionPlan> greedy_plan;
         {
-            Graph greedy = base;
+            Graph greedy = *this;
             Neighborhood greedy_n = n;
             std::vector<std::pair<int, int>> chosen;
 
@@ -494,12 +830,8 @@ struct Graph {
                             for (int j = 0; j < 3; ++j) {
                                 int lhs = greedy_n.children[a][i];
                                 int rhs = greedy_n.children[b][j];
-                                int participation_cap =
-                                    (nodes[root].role == Node::Role::leaf) ? 3 : 2;
-                                if (greedy.rooted_participation_count(greedy_n, lhs) >=
-                                        participation_cap ||
-                                    greedy.rooted_participation_count(greedy_n, rhs) >=
-                                        participation_cap) {
+                                if (greedy.participation_limit_reached(greedy_n, root, lhs) ||
+                                    greedy.participation_limit_reached(greedy_n, root, rhs)) {
                                     continue;
                                 }
                                 if (greedy.shared_neighbor(lhs, rhs) != -1 ||
@@ -538,118 +870,192 @@ struct Graph {
             }
         }
 
-        std::set<std::vector<std::pair<int, int>>> seen;
-        std::vector<CompletionPlan> out;
-        if (greedy_plan) {
+        if (greedy_plan && seen.insert(greedy_plan->add_pairs).second) {
             out.push_back(*greedy_plan);
-            seen.insert(greedy_plan->add_pairs);
+        }
+        CompletionFingerprint initial_fp = completion_fingerprint(root, n);
+        if (has_dead_root_cache(ctx, initial_fp)) {
+            note_dead_root_cache_hit(ctx);
+            return out;
         }
 
-        auto search = [&](auto&& self, const Graph& cur_graph,
-                          const Neighborhood& cur_n,
-                          std::vector<std::pair<int, int>>& chosen) -> void {
-            if (static_cast<int>(out.size()) >= max_results) {
-                return;
-            }
+        struct LocalCompletionState {
+            CompletionFingerprint fp;
+            std::uint64_t forbidden_mask = 0;
 
-            int loops = cur_graph.rooted_loop_count(root);
-            if (loops >= 12) {
-                std::vector<std::pair<int, int>> normalized = chosen;
-                std::sort(normalized.begin(), normalized.end());
-                normalized.erase(std::unique(normalized.begin(), normalized.end()),
-                                 normalized.end());
-                if (!seen.insert(normalized).second) {
-                    return;
-                }
-                out.push_back(CompletionPlan{
-                    .add_pairs = normalized,
-                    .reused_pairs = loops - static_cast<int>(normalized.size()),
-                    .new_nodes = static_cast<int>(normalized.size()),
-                });
-                return;
-            }
-
-            struct CandidateEdge {
-                int a;
-                int b;
-                int score;
-            };
-
-            std::vector<CandidateEdge> edges;
-            for (int a = 0; a < 4; ++a) {
-                for (int b = a + 1; b < 4; ++b) {
-                    for (int i = 0; i < 3; ++i) {
-                        for (int j = 0; j < 3; ++j) {
-                            int lhs = cur_n.children[a][i];
-                            int rhs = cur_n.children[b][j];
-                            int participation_cap =
-                                (nodes[root].role == Node::Role::leaf) ? 3 : 2;
-                            if (cur_graph.rooted_participation_count(cur_n, lhs) >=
-                                    participation_cap ||
-                                cur_graph.rooted_participation_count(cur_n, rhs) >=
-                                    participation_cap) {
-                                continue;
-                            }
-                            if (cur_graph.shared_neighbor(lhs, rhs) != -1 ||
-                                !cur_graph.can_split_with_new_node(lhs, rhs)) {
-                                continue;
-                            }
-                            edges.push_back(CandidateEdge{
-                                .a = std::min(lhs, rhs),
-                                .b = std::max(lhs, rhs),
-                                .score = 10 * (cur_graph.nodes[lhs].free_slots() +
-                                               cur_graph.nodes[rhs].free_slots()) -
-                                         (cur_graph.nodes[lhs].degree() +
-                                          cur_graph.nodes[rhs].degree()),
-                            });
-                        }
-                    }
-                }
-            }
-
-            std::sort(edges.begin(), edges.end(), [](const CandidateEdge& lhs,
-                                                     const CandidateEdge& rhs) {
-                if (lhs.score != rhs.score) {
-                    return lhs.score > rhs.score;
-                }
-                if (lhs.a != rhs.a) {
-                    return lhs.a < rhs.a;
-                }
-                return lhs.b < rhs.b;
-            });
-            edges.erase(std::unique(edges.begin(), edges.end(),
-                                    [](const CandidateEdge& lhs,
-                                       const CandidateEdge& rhs) {
-                                        return lhs.a == rhs.a && lhs.b == rhs.b;
-                                    }),
-                        edges.end());
-
-            int remaining_needed = 12 - loops;
-            if (static_cast<int>(edges.size()) < remaining_needed) {
-                return;
-            }
-
-            static constexpr int kLocalBeam = 6;
-            int explored = 0;
-            for (const auto& edge : edges) {
-                if (explored++ >= kLocalBeam) {
-                    break;
-                }
-                Graph next_graph = cur_graph;
-                if (next_graph.ensure_split(edge.a, edge.b) == -1) {
-                    continue;
-                }
-                chosen.push_back({edge.a, edge.b});
-                self(self, next_graph, cur_n, chosen);
-                chosen.pop_back();
-                if (static_cast<int>(out.size()) >= max_results) {
-                    return;
-                }
+            bool operator==(const LocalCompletionState& other) const {
+                return fp == other.fp && forbidden_mask == other.forbidden_mask;
             }
         };
 
+        struct LocalCompletionStateHasher {
+            std::size_t operator()(const LocalCompletionState& value) const {
+                return static_cast<std::size_t>(
+                    (value.fp.lo ^ (value.fp.hi * 0x517cc1b727220a95ULL)) ^
+                    (value.forbidden_mask * 0x9e3779b97f4a7c15ULL));
+            }
+        };
+
+        std::unordered_set<LocalCompletionState, LocalCompletionStateHasher> local_seen;
+        local_seen.reserve(1 << 15);
+
+        static constexpr auto kPairs = child_pair_positions();
+
+        auto search = [&](auto&& self, const Graph& cur_graph,
+                          const Neighborhood& cur_n, std::uint64_t forbidden_mask,
+                          std::vector<std::pair<int, int>>& chosen) -> void {
+                if (max_results != 0 && out.size() >= max_results) {
+                    return;
+                }
+
+                LocalCompletionState local_state{
+                    .fp = cur_graph.completion_fingerprint(root, cur_n),
+                    .forbidden_mask = forbidden_mask,
+                };
+                if (!local_seen.insert(local_state).second) {
+                    note_local_cache_hit(ctx);
+                    return;
+                }
+                note_local_completion_state(ctx);
+
+                if (pending_roots && chosen.size() >= 4) {
+                    for (const auto& [pending_root, pending_depth] : *pending_roots) {
+                        if (max_depth >= 0 && pending_depth > max_depth) {
+                            continue;
+                        }
+                        if (!analyze_root_generation(cur_graph, pending_root).any_feasible_variant) {
+                            note_impossible_root_prune(ctx);
+                            return;
+                        }
+                    }
+                }
+
+                int loops = cur_graph.rooted_loop_count(root);
+                if (loops >= 12) {
+                    std::vector<std::pair<int, int>> normalized = chosen;
+                    std::sort(normalized.begin(), normalized.end());
+                    normalized.erase(std::unique(normalized.begin(), normalized.end()),
+                                     normalized.end());
+                    if (!seen.insert(normalized).second) {
+                        return;
+                    }
+                    out.push_back(CompletionPlan{
+                        .add_pairs = normalized,
+                        .reused_pairs = loops - static_cast<int>(normalized.size()),
+                        .new_nodes = static_cast<int>(normalized.size()),
+                    });
+                    return;
+                }
+
+                int remaining_needed = 12 - loops;
+                if (cur_graph.max_additional_loops_capacity_bound(cur_n, root) < remaining_needed) {
+                    note_capacity_prune(ctx);
+                    return;
+                }
+
+                struct CandidateEdge {
+                    int pos;
+                    int a;
+                    int b;
+                    int score;
+                };
+
+                std::vector<CandidateEdge> edges;
+                for (int pos = 0; pos < static_cast<int>(kPairs.size()); ++pos) {
+                    if (((forbidden_mask >> pos) & 1ULL) != 0) {
+                        continue;
+                    }
+                    const auto& [lhs_idx, rhs_idx] = kPairs[pos];
+                    int lhs = cur_n.children[lhs_idx / 3][lhs_idx % 3];
+                    int rhs = cur_n.children[rhs_idx / 3][rhs_idx % 3];
+                    if (cur_graph.participation_limit_reached(cur_n, root, lhs) ||
+                        cur_graph.participation_limit_reached(cur_n, root, rhs)) {
+                        continue;
+                    }
+                    if (cur_graph.shared_neighbor(lhs, rhs) != -1 ||
+                        !cur_graph.can_split_with_new_node(lhs, rhs)) {
+                        continue;
+                    }
+                    edges.push_back(CandidateEdge{
+                        .pos = pos,
+                        .a = std::min(lhs, rhs),
+                        .b = std::max(lhs, rhs),
+                        .score = 10 * (cur_graph.nodes[lhs].free_slots() +
+                                       cur_graph.nodes[rhs].free_slots()) -
+                                 (cur_graph.nodes[lhs].degree() +
+                                  cur_graph.nodes[rhs].degree()),
+                    });
+                }
+
+                std::sort(edges.begin(), edges.end(), [](const CandidateEdge& lhs,
+                                                         const CandidateEdge& rhs) {
+                    if (lhs.score != rhs.score) {
+                        return lhs.score > rhs.score;
+                    }
+                    if (lhs.a != rhs.a) {
+                        return lhs.a < rhs.a;
+                    }
+                    return lhs.b < rhs.b;
+                });
+                edges.erase(std::unique(edges.begin(), edges.end(),
+                                        [](const CandidateEdge& lhs,
+                                           const CandidateEdge& rhs) {
+                                            return lhs.a == rhs.a && lhs.b == rhs.b;
+                                        }),
+                            edges.end());
+
+                if (static_cast<int>(edges.size()) < remaining_needed) {
+                    return;
+                }
+
+                std::vector<std::pair<int, int>> legal_pairs;
+                legal_pairs.reserve(edges.size());
+                for (const auto& edge : edges) {
+                    legal_pairs.push_back({edge.a, edge.b});
+                }
+                if (cur_graph.max_additional_loops_exact_bound(cur_n, root, legal_pairs) <
+                    remaining_needed) {
+                    note_legal_edge_prune(ctx);
+                    return;
+                }
+
+                std::unordered_map<int, int> incident_counts;
+                incident_counts.reserve(12);
+                for (const auto& edge : edges) {
+                    ++incident_counts[edge.a];
+                    ++incident_counts[edge.b];
+                }
+                for (auto& edge : edges) {
+                    int lhs_options = incident_counts[edge.a];
+                    int rhs_options = incident_counts[edge.b];
+                    edge.score = 1000 - 100 * (lhs_options + rhs_options) +
+                                 10 * (cur_graph.nodes[edge.a].free_slots() +
+                                       cur_graph.nodes[edge.b].free_slots()) -
+                                 (cur_graph.nodes[edge.a].degree() +
+                                  cur_graph.nodes[edge.b].degree());
+                }
+
+                const CandidateEdge edge = edges.front();
+
+                Graph include_graph = cur_graph;
+                if (include_graph.ensure_split(edge.a, edge.b) != -1) {
+                    chosen.push_back({edge.a, edge.b});
+                    self(self, include_graph, cur_n, forbidden_mask | (1ULL << edge.pos), chosen);
+                    chosen.pop_back();
+                    if (max_results != 0 && out.size() >= max_results) {
+                        return;
+                    }
+                }
+
+                self(self, cur_graph, cur_n, forbidden_mask | (1ULL << edge.pos), chosen);
+        };
+
         std::vector<std::pair<int, int>> chosen;
-        search(search, base, n, chosen);
+        search(search, *this, n, 0, chosen);
+
+        if (out.empty()) {
+            remember_dead_root_cache(ctx, initial_fp);
+        }
 
         std::sort(out.begin(), out.end(), [](const CompletionPlan& lhs,
                                              const CompletionPlan& rhs) {
@@ -658,10 +1064,21 @@ struct Graph {
             }
             return lhs.new_nodes < rhs.new_nodes;
         });
-        if (static_cast<int>(out.size()) > max_results) {
+        if (max_results != 0 && out.size() > max_results) {
             out.resize(max_results);
         }
         return out;
+    }
+
+    std::vector<CompletionPlan> generate_completion_candidates(int root,
+                                                               std::size_t max_results = 0) const {
+        Graph base = *this;
+        auto maybe_n = base.materialize_neighborhood(root);
+        if (!maybe_n) {
+            return {};
+        }
+        return base.generate_completion_candidates_for_materialized(root, *maybe_n, nullptr,
+                                                                    max_results);
     }
 
     int rooted_loop_count(int root) const {
@@ -794,6 +1211,564 @@ struct SearchState {
     std::vector<bool> completed;
 };
 
+struct RootCandidate {
+    Graph graph;
+    Graph::CompletionPlan plan;
+};
+
+std::vector<RootCandidate> generate_root_candidates(const Graph& source, int root,
+                                                    SearchContext* ctx = nullptr,
+                                                    std::size_t max_results = 0,
+                                                    const std::vector<std::pair<int, int>>* pending_roots = nullptr,
+                                                    int max_depth = -1) {
+    std::vector<RootCandidate> out;
+    std::set<std::vector<std::pair<int, int>>> seen_plans;
+    note_root_candidate_call(ctx);
+
+    auto append_variant = [&](Graph& base, const Graph::Neighborhood& n) {
+        std::vector<Graph::CompletionPlan> plans =
+            base.generate_completion_candidates_for_materialized(root, n, ctx, max_results,
+                                                                 pending_roots, max_depth);
+        for (const auto& plan : plans) {
+            if (!seen_plans.insert(plan.add_pairs).second) {
+                continue;
+            }
+            out.push_back(RootCandidate{
+                .graph = base,
+                .plan = plan,
+            });
+            if (max_results != 0 && out.size() >= max_results) {
+                return;
+            }
+        }
+    };
+
+    if (source.nodes[root].role == Node::Role::leaf) {
+        std::vector<int> branch_side;
+        std::vector<int> split_side;
+        std::vector<int> outward_side;
+        for (int nb : source.neighbors(root)) {
+            if (source.nodes[nb].role == Node::Role::branch ||
+                source.nodes[nb].role == Node::Role::center) {
+                branch_side.push_back(nb);
+            } else if (source.nodes[nb].role == Node::Role::split) {
+                split_side.push_back(nb);
+            } else {
+                outward_side.push_back(nb);
+            }
+        }
+        if (branch_side.empty()) {
+            branch_side = source.neighbors(root);
+        }
+
+        std::set<std::array<int, 4>> seen_branch_assignments;
+        const int branch_choice_count = std::max<int>(1, static_cast<int>(branch_side.size()));
+        const int outward_choice_count = std::max<int>(1, static_cast<int>(outward_side.size()));
+        const int split_choice_count = std::max<int>(2, static_cast<int>(split_side.size()));
+
+        for (int branch_choice = 0; branch_choice < branch_choice_count; ++branch_choice) {
+            for (int split_a = 0; split_a < split_choice_count; ++split_a) {
+                for (int split_b = split_a + 1; split_b < split_choice_count; ++split_b) {
+                    for (int outward_choice = 0; outward_choice < outward_choice_count;
+                         ++outward_choice) {
+                        note_variant_attempt(ctx);
+                        Graph base = source;
+                        auto maybe_n = base.materialize_leaf_neighborhood_with_choices(
+                            root, branch_choice, {split_a, split_b}, outward_choice);
+                        if (!maybe_n) {
+                            continue;
+                        }
+                        if (!seen_branch_assignments.insert(maybe_n->branches).second) {
+                            continue;
+                        }
+                        note_variant_materialized(ctx);
+                        append_variant(base, *maybe_n);
+                        if (max_results != 0 && out.size() >= max_results) {
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+
+        Graph generic = source;
+        auto maybe_generic = generic.materialize_generic_neighborhood(root);
+        if (maybe_generic && seen_branch_assignments.insert(maybe_generic->branches).second) {
+            note_variant_materialized(ctx);
+            append_variant(generic, *maybe_generic);
+            if (max_results != 0 && out.size() >= max_results) {
+                return out;
+            }
+        }
+
+        Graph fallback = source;
+        auto maybe_fallback = fallback.materialize_center_neighborhood(root);
+        if (maybe_fallback) {
+            note_variant_materialized(ctx);
+            append_variant(fallback, *maybe_fallback);
+        }
+    } else {
+        Graph base = source;
+        auto maybe_n = base.materialize_neighborhood(root);
+        if (maybe_n) {
+            note_variant_materialized(ctx);
+            append_variant(base, *maybe_n);
+        }
+    }
+
+    return out;
+}
+
+std::vector<std::pair<int, int>> collect_legal_completion_pairs(const Graph& graph,
+                                                                const Graph::Neighborhood& n,
+                                                                int root) {
+    std::vector<std::pair<int, int>> legal_pairs;
+    legal_pairs.reserve(54);
+    for (int a = 0; a < 4; ++a) {
+        for (int b = a + 1; b < 4; ++b) {
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    int lhs = n.children[a][i];
+                    int rhs = n.children[b][j];
+                    if (graph.participation_limit_reached(n, root, lhs) ||
+                        graph.participation_limit_reached(n, root, rhs)) {
+                        continue;
+                    }
+                    if (graph.shared_neighbor(lhs, rhs) != -1 ||
+                        !graph.can_split_with_new_node(lhs, rhs)) {
+                        continue;
+                    }
+                    legal_pairs.push_back({std::min(lhs, rhs), std::max(lhs, rhs)});
+                }
+            }
+        }
+    }
+    std::sort(legal_pairs.begin(), legal_pairs.end());
+    legal_pairs.erase(std::unique(legal_pairs.begin(), legal_pairs.end()), legal_pairs.end());
+    return legal_pairs;
+}
+
+RootGenerationEstimate analyze_root_generation(const Graph& graph, int root) {
+    std::uint64_t variant_count = 0;
+    int best_upper_bound = std::numeric_limits<int>::max();
+    int worst_upper_bound = std::numeric_limits<int>::min();
+    int best_slack = std::numeric_limits<int>::max();
+
+    auto consider_variant = [&](Graph& base, const Graph::Neighborhood& n) {
+        ++variant_count;
+        CompletionFingerprint fp = base.completion_fingerprint(root, n);
+        int upper_bound = 0;
+        auto it = g_variant_upper_bound_cache.find(fp);
+        if (it != g_variant_upper_bound_cache.end()) {
+            upper_bound = it->second;
+        } else {
+            int loops = base.rooted_loop_count(root);
+            std::vector<std::pair<int, int>> legal_pairs =
+                collect_legal_completion_pairs(base, n, root);
+            upper_bound = loops + base.max_additional_loops_exact_bound(n, root, legal_pairs);
+            g_variant_upper_bound_cache.emplace(fp, upper_bound);
+        }
+        worst_upper_bound = std::max(worst_upper_bound, upper_bound);
+        int slack = std::max(0, upper_bound - 12);
+        best_upper_bound = std::min(best_upper_bound, upper_bound);
+        best_slack = std::min(best_slack, slack);
+    };
+
+    if (graph.nodes[root].role == Node::Role::leaf) {
+        std::vector<int> branch_side;
+        std::vector<int> split_side;
+        std::vector<int> outward_side;
+        for (int nb : graph.neighbors(root)) {
+            if (graph.nodes[nb].role == Node::Role::branch ||
+                graph.nodes[nb].role == Node::Role::center) {
+                branch_side.push_back(nb);
+            } else if (graph.nodes[nb].role == Node::Role::split) {
+                split_side.push_back(nb);
+            } else {
+                outward_side.push_back(nb);
+            }
+        }
+        if (branch_side.empty()) {
+            branch_side = graph.neighbors(root);
+        }
+
+        std::set<std::array<int, 4>> seen_branch_assignments;
+        const int branch_choice_count = std::max<int>(1, static_cast<int>(branch_side.size()));
+        const int outward_choice_count = std::max<int>(1, static_cast<int>(outward_side.size()));
+        const int split_choice_count = std::max<int>(2, static_cast<int>(split_side.size()));
+
+        for (int branch_choice = 0; branch_choice < branch_choice_count; ++branch_choice) {
+            for (int split_a = 0; split_a < split_choice_count; ++split_a) {
+                for (int split_b = split_a + 1; split_b < split_choice_count; ++split_b) {
+                    for (int outward_choice = 0; outward_choice < outward_choice_count;
+                         ++outward_choice) {
+                        Graph base = graph;
+                        auto maybe_n = base.materialize_leaf_neighborhood_with_choices(
+                            root, branch_choice, {split_a, split_b}, outward_choice);
+                        if (!maybe_n) {
+                            continue;
+                        }
+                        if (!seen_branch_assignments.insert(maybe_n->branches).second) {
+                            continue;
+                        }
+                        consider_variant(base, *maybe_n);
+                    }
+                }
+            }
+        }
+
+        Graph generic = graph;
+        auto maybe_generic = generic.materialize_generic_neighborhood(root);
+        if (maybe_generic && seen_branch_assignments.insert(maybe_generic->branches).second) {
+            consider_variant(generic, *maybe_generic);
+        }
+
+        Graph fallback = graph;
+        auto maybe_fallback = fallback.materialize_center_neighborhood(root);
+        if (maybe_fallback) {
+            consider_variant(fallback, *maybe_fallback);
+        }
+    } else {
+        Graph base = graph;
+        auto maybe_n = base.materialize_neighborhood(root);
+        if (maybe_n) {
+            consider_variant(base, *maybe_n);
+        }
+    }
+
+    if (variant_count == 0) {
+        return RootGenerationEstimate{};
+    }
+
+    if (worst_upper_bound < 12) {
+        return RootGenerationEstimate{
+            .order_cost = 0,
+            .any_feasible_variant = false,
+        };
+    }
+
+    return RootGenerationEstimate{
+        .order_cost = static_cast<std::uint64_t>(best_slack) * 1000000ULL + variant_count,
+        .any_feasible_variant = true,
+    };
+}
+
+struct StateFingerprint {
+    std::uint64_t lo = 0;
+    std::uint64_t hi = 0;
+
+    bool operator==(const StateFingerprint& other) const {
+        return lo == other.lo && hi == other.hi;
+    }
+};
+
+struct StateFingerprintHasher {
+    std::size_t operator()(const StateFingerprint& value) const {
+        return static_cast<std::size_t>(value.lo ^ (value.hi * 0x9e3779b97f4a7c15ULL));
+    }
+};
+
+StateFingerprint fingerprint_state(const SearchState& state) {
+    const int node_count = static_cast<int>(state.graph.nodes.size());
+    if (node_count == 0) {
+        return {};
+    }
+
+    std::vector<int> colors(node_count, 0);
+    for (int i = 0; i < node_count; ++i) {
+        const Node& node = state.graph.nodes[i];
+        const int depth = i < static_cast<int>(state.depth_seen.size()) ? state.depth_seen[i] : -1;
+        const int done =
+            (i < static_cast<int>(state.completed.size()) && state.completed[i]) ? 1 : 0;
+        int role_mask = 0;
+        for (int nb : node.adj) {
+            if (nb != -1) {
+                role_mask |= 1 << static_cast<int>(state.graph.nodes[nb].role);
+            }
+        }
+        colors[i] = static_cast<int>(node.role) * 10000 + node.degree() * 1000 +
+                    node.free_slots() * 100 + done * 10 + (depth + 1);
+        colors[i] = colors[i] * 64 + role_mask;
+    }
+
+    for (int round = 0; round < 8; ++round) {
+        std::unordered_map<std::string, int> intern;
+        intern.reserve(node_count * 2);
+        std::vector<int> next_colors(node_count, 0);
+        int next_id = 1;
+
+        for (int i = 0; i < node_count; ++i) {
+            std::vector<int> neighbor_colors;
+            neighbor_colors.reserve(4);
+            for (int nb : state.graph.nodes[i].adj) {
+                neighbor_colors.push_back(nb == -1 ? -1 : colors[nb]);
+            }
+            std::sort(neighbor_colors.begin(), neighbor_colors.end());
+
+            std::string key;
+            key.reserve(64);
+            key += std::to_string(colors[i]);
+            key.push_back('|');
+            for (int color : neighbor_colors) {
+                key += std::to_string(color);
+                key.push_back(',');
+            }
+
+            auto [it, inserted] = intern.emplace(key, next_id);
+            if (inserted) {
+                ++next_id;
+            }
+            next_colors[i] = it->second;
+        }
+
+        if (next_colors == colors) {
+            break;
+        }
+        colors = std::move(next_colors);
+    }
+
+    std::vector<std::tuple<int, int, int, std::array<int, 4>>> descriptors;
+    descriptors.reserve(node_count);
+    for (int i = 0; i < node_count; ++i) {
+        std::array<int, 4> neighbor_colors{-1, -1, -1, -1};
+        for (int j = 0; j < 4; ++j) {
+            int nb = state.graph.nodes[i].adj[j];
+            neighbor_colors[j] = nb == -1 ? -1 : colors[nb];
+        }
+        std::sort(neighbor_colors.begin(), neighbor_colors.end());
+        const int depth = i < static_cast<int>(state.depth_seen.size()) ? state.depth_seen[i] : -1;
+        const int done =
+            (i < static_cast<int>(state.completed.size()) && state.completed[i]) ? 1 : 0;
+        descriptors.push_back({colors[i], depth, done, neighbor_colors});
+    }
+    std::sort(descriptors.begin(), descriptors.end());
+
+    std::vector<std::pair<int, int>> todo_summary;
+    todo_summary.reserve(state.todo.size());
+    for (const auto& [node, depth] : state.todo) {
+        todo_summary.push_back({depth, colors[node]});
+    }
+    std::sort(todo_summary.begin(), todo_summary.end());
+
+    FingerprintBuilder builder;
+    builder.mix(static_cast<std::uint64_t>(node_count));
+    for (const auto& [color, depth, done, neighbor_colors] : descriptors) {
+        builder.mix(static_cast<std::uint64_t>(color));
+        builder.mix(static_cast<std::uint64_t>(depth + 2));
+        builder.mix(static_cast<std::uint64_t>(done));
+        for (int neighbor_color : neighbor_colors) {
+            builder.mix(static_cast<std::uint64_t>(neighbor_color + 2));
+        }
+    }
+    builder.mix(static_cast<std::uint64_t>(todo_summary.size()));
+    for (const auto& [depth, color] : todo_summary) {
+        builder.mix(static_cast<std::uint64_t>(depth + 2));
+        builder.mix(static_cast<std::uint64_t>(color));
+    }
+    return StateFingerprint{.lo = builder.lo, .hi = builder.hi};
+}
+
+struct SearchContext {
+    std::unordered_set<StateFingerprint, StateFingerprintHasher> visited;
+    std::unordered_set<CompletionFingerprint, CompletionFingerprintHasher> dead_local_completion_roots;
+    std::uint64_t states_entered = 0;
+    std::uint64_t cache_hits = 0;
+    std::uint64_t candidate_batches = 0;
+    std::uint64_t candidate_plans = 0;
+    std::uint64_t root_candidate_calls = 0;
+    std::uint64_t variant_attempts = 0;
+    std::uint64_t variants_materialized = 0;
+    std::uint64_t local_completion_states = 0;
+    std::uint64_t local_completion_cache_hits = 0;
+    std::uint64_t dead_root_cache_hits = 0;
+    std::uint64_t impossible_root_prunes = 0;
+    std::uint64_t local_capacity_prunes = 0;
+    std::uint64_t local_legal_edge_prunes = 0;
+    std::uint64_t dead_end_no_candidates = 0;
+    std::uint64_t materialize_failures = 0;
+    std::uint64_t split_apply_failures = 0;
+    std::uint64_t solutions_checked = 0;
+    std::uint64_t progress_interval_states = 1000;
+    int target_depth = 0;
+    int active_root = -1;
+    int active_generation_depth = -1;
+    std::size_t active_generation_todo = 0;
+    std::size_t active_generation_nodes = 0;
+    std::vector<std::uint64_t> states_by_depth;
+    std::vector<std::uint64_t> dead_ends_by_depth;
+    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_report_time = start_time;
+
+    void ensure_depth_slot(int depth) {
+        if (depth >= static_cast<int>(states_by_depth.size())) {
+            states_by_depth.resize(depth + 1, 0);
+            dead_ends_by_depth.resize(depth + 1, 0);
+        }
+    }
+
+    void report_progress(const char* reason, int active_depth, std::size_t cache_size,
+                         std::size_t todo_size, std::size_t node_count) {
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - start_time).count();
+        const double delta_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_report_time)
+                .count();
+        if (reason == nullptr) {
+            if (states_entered == 0 || states_entered % progress_interval_states != 0) {
+                return;
+            }
+            if (delta_s < 1.0) {
+                return;
+            }
+        }
+
+        std::cout << "[progress] depth=" << target_depth
+                  << " reason=" << (reason ? reason : "tick")
+                  << " elapsed_s=" << elapsed_s
+                  << " states=" << states_entered
+                  << " cache_size=" << cache_size
+                  << " cache_hits=" << cache_hits
+                  << " candidate_batches=" << candidate_batches
+                  << " candidate_plans=" << candidate_plans
+                  << " root_candidate_calls=" << root_candidate_calls
+                  << " variant_attempts=" << variant_attempts
+                  << " variants_materialized=" << variants_materialized
+                  << " local_completion_states=" << local_completion_states
+                  << " local_completion_cache_hits=" << local_completion_cache_hits
+                  << " dead_root_cache_hits=" << dead_root_cache_hits
+                  << " impossible_root_prunes=" << impossible_root_prunes
+                  << " local_capacity_prunes=" << local_capacity_prunes
+                  << " local_legal_edge_prunes=" << local_legal_edge_prunes
+                  << " dead_no_candidates=" << dead_end_no_candidates
+                  << " materialize_failures=" << materialize_failures
+                  << " split_apply_failures=" << split_apply_failures
+                  << " solutions_checked=" << solutions_checked
+                  << " active_depth=" << active_depth
+                  << " active_root=" << active_root
+                  << " todo=" << todo_size
+                  << " nodes=" << node_count
+                  << '\n';
+
+        std::cout << "[progress-depths]";
+        for (int depth = 0; depth < static_cast<int>(states_by_depth.size()); ++depth) {
+            std::cout << " d" << depth << "=" << states_by_depth[depth]
+                      << "/dead=" << dead_ends_by_depth[depth];
+        }
+        std::cout << '\n';
+        last_report_time = now;
+    }
+
+    void report_generation_progress(const char* reason) {
+        const auto now = std::chrono::steady_clock::now();
+        const double delta_s =
+            std::chrono::duration_cast<std::chrono::duration<double>>(now - last_report_time)
+                .count();
+        if (reason == nullptr) {
+            if (local_completion_states == 0 ||
+                local_completion_states % progress_interval_states != 0) {
+                return;
+            }
+            if (delta_s < 1.0) {
+                return;
+            }
+        }
+        report_progress(reason ? reason : "root-gen-tick", active_generation_depth,
+                        visited.size(), active_generation_todo, active_generation_nodes);
+    }
+};
+
+void note_local_cache_hit(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->local_completion_cache_hits;
+    ctx->report_generation_progress(nullptr);
+}
+
+void note_local_completion_state(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->local_completion_states;
+    ctx->report_generation_progress(nullptr);
+}
+
+void note_generation_progress(SearchContext* ctx, const char* reason) {
+    if (!ctx) {
+        return;
+    }
+    ctx->report_generation_progress(reason);
+}
+
+void note_root_candidate_call(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->root_candidate_calls;
+}
+
+void note_variant_attempt(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->variant_attempts;
+}
+
+void note_variant_materialized(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->variants_materialized;
+    ctx->report_generation_progress(nullptr);
+}
+
+void note_capacity_prune(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->local_capacity_prunes;
+    ctx->report_generation_progress(nullptr);
+}
+
+void note_legal_edge_prune(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->local_legal_edge_prunes;
+    ctx->report_generation_progress(nullptr);
+}
+
+void note_dead_root_cache_hit(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->dead_root_cache_hits;
+    ctx->report_generation_progress(nullptr);
+}
+
+void note_impossible_root_prune(SearchContext* ctx) {
+    if (!ctx) {
+        return;
+    }
+    ++ctx->impossible_root_prunes;
+    ctx->report_generation_progress(nullptr);
+}
+
+bool has_dead_root_cache(SearchContext* ctx, const CompletionFingerprint& fp) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->dead_local_completion_roots.contains(fp);
+}
+
+void remember_dead_root_cache(SearchContext* ctx, const CompletionFingerprint& fp) {
+    if (!ctx) {
+        return;
+    }
+    ctx->dead_local_completion_roots.insert(fp);
+}
+
 bool enqueue_neighbors(SearchState& state, int root, int depth, int max_depth) {
     if (depth == max_depth) {
         return true;
@@ -817,53 +1792,82 @@ bool enqueue_neighbors(SearchState& state, int root, int depth, int max_depth) {
     return true;
 }
 
-bool expand_with_backtracking(const SearchState& state, int max_depth, int branching_cap) {
+bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int max_depth) {
     SearchState cur = state;
     while (!cur.todo.empty() && cur.completed[cur.todo.front().first]) {
         cur.todo.pop_front();
     }
 
     if (cur.todo.empty()) {
+        ++ctx.solutions_checked;
         return cur.graph.validate_depth(0, max_depth);
     }
+
+    int active_depth = cur.todo.front().second;
+    ctx.ensure_depth_slot(active_depth);
+    ++ctx.states_entered;
+    ++ctx.states_by_depth[active_depth];
+
+    StateFingerprint fp = fingerprint_state(cur);
+    if (!ctx.visited.insert(fp).second) {
+        ++ctx.cache_hits;
+        ctx.report_progress(nullptr, active_depth, ctx.visited.size(), cur.todo.size(),
+                            cur.graph.nodes.size());
+        return false;
+    }
+    ctx.report_progress(nullptr, active_depth, ctx.visited.size(), cur.todo.size(),
+                        cur.graph.nodes.size());
 
     int chosen_index = -1;
     int chosen_root = -1;
     int chosen_depth = -1;
-    Graph chosen_graph;
-    std::vector<Graph::CompletionPlan> chosen_candidates;
+    std::vector<RootCandidate> chosen_candidates;
+    std::uint64_t best_estimate = 0;
 
     for (int i = 0; i < static_cast<int>(cur.todo.size()); ++i) {
         auto [root, depth] = cur.todo[i];
-        Graph probe = cur.graph;
-        if (!probe.materialize_neighborhood(root)) {
-            std::cout << "failed to materialize neighborhood for root " << root
-                      << " at depth " << depth << '\n';
-            return false;
-        }
-
-        std::vector<Graph::CompletionPlan> candidates =
-            probe.generate_completion_candidates(root, branching_cap);
-        if (candidates.empty()) {
-            std::cout << "no completion candidates for root " << root
-                      << " at depth " << depth
-                      << " role=" << static_cast<int>(probe.nodes[root].role)
-                      << " degree=" << probe.nodes[root].degree() << '\n';
-            return false;
-        }
-
-        if (chosen_index == -1 ||
-            static_cast<int>(candidates.size()) < static_cast<int>(chosen_candidates.size())) {
+        RootGenerationEstimate estimate = analyze_root_generation(cur.graph, root);
+        if (chosen_index == -1 || estimate.order_cost < best_estimate ||
+            (estimate.order_cost == best_estimate && depth < chosen_depth) ||
+            (estimate.order_cost == best_estimate && depth == chosen_depth && root < chosen_root)) {
             chosen_index = i;
             chosen_root = root;
             chosen_depth = depth;
-            chosen_graph = std::move(probe);
-            chosen_candidates = std::move(candidates);
-            if (chosen_candidates.size() == 1) {
-                break;
-            }
+            best_estimate = estimate.order_cost;
         }
     }
+
+    if (chosen_index != -1) {
+        ctx.active_root = chosen_root;
+        ctx.active_generation_depth = chosen_depth;
+        ctx.active_generation_todo = cur.todo.size();
+        ctx.active_generation_nodes = cur.graph.nodes.size();
+        std::vector<std::pair<int, int>> pending_roots;
+        pending_roots.reserve(cur.todo.size());
+        for (int i = 0; i < static_cast<int>(cur.todo.size()); ++i) {
+            if (i == chosen_index) {
+                continue;
+            }
+            pending_roots.push_back(cur.todo[i]);
+        }
+        chosen_candidates = generate_root_candidates(cur.graph, chosen_root, &ctx, 0,
+                                                     &pending_roots, max_depth);
+        ++ctx.candidate_batches;
+        ctx.candidate_plans += chosen_candidates.size();
+        if (chosen_candidates.empty()) {
+            ++ctx.dead_end_no_candidates;
+            ++ctx.dead_ends_by_depth[chosen_depth];
+            ctx.report_progress("no-candidates", chosen_depth, ctx.visited.size(), cur.todo.size(),
+                                cur.graph.nodes.size());
+            std::cout << "no completion candidates for root " << chosen_root
+                      << " at depth " << chosen_depth
+                      << " role=" << static_cast<int>(cur.graph.nodes[chosen_root].role)
+                      << " degree=" << cur.graph.nodes[chosen_root].degree() << '\n';
+            return false;
+        }
+    }
+
+    ctx.active_root = -1;
 
     if (chosen_index == -1) {
         return false;
@@ -873,10 +1877,11 @@ bool expand_with_backtracking(const SearchState& state, int max_depth, int branc
 
     for (const auto& cand : chosen_candidates) {
         SearchState next = cur;
-        next.graph = chosen_graph;
+        next.graph = cand.graph;
         bool ok = true;
-        for (const auto& [a, b] : cand.add_pairs) {
+        for (const auto& [a, b] : cand.plan.add_pairs) {
             if (next.graph.ensure_split(a, b) == -1) {
+                ++ctx.split_apply_failures;
                 ok = false;
                 break;
             }
@@ -889,10 +1894,28 @@ bool expand_with_backtracking(const SearchState& state, int max_depth, int branc
             next.depth_seen.resize(next.graph.nodes.size(), -1);
         }
         next.completed[chosen_root] = true;
+        bool impossible_pending_root = false;
+        for (const auto& [pending_root, pending_depth] : next.todo) {
+            if (pending_depth > max_depth) {
+                continue;
+            }
+            if (pending_root < static_cast<int>(next.completed.size()) &&
+                next.completed[pending_root]) {
+                continue;
+            }
+            if (!analyze_root_generation(next.graph, pending_root).any_feasible_variant) {
+                impossible_pending_root = true;
+                break;
+            }
+        }
+        if (impossible_pending_root) {
+            ++ctx.impossible_root_prunes;
+            continue;
+        }
         if (!enqueue_neighbors(next, chosen_root, chosen_depth, max_depth)) {
             continue;
         }
-        if (expand_with_backtracking(next, max_depth, branching_cap)) {
+        if (expand_with_backtracking(ctx, next, max_depth)) {
             return true;
         }
     }
@@ -930,10 +1953,33 @@ Graph build_seed() {
 }
 
 int main() {
-    constexpr int kBranchingCap = 8;
+    std::cout << std::unitbuf;
+
     constexpr int kMaxDepth = 4;
+    constexpr std::size_t kDefaultCacheReserve = 1'000'000;
+    constexpr std::uint64_t kDefaultProgressIntervalStates = 10'000;
+    std::size_t cache_reserve = kDefaultCacheReserve;
+    std::uint64_t progress_interval_states = kDefaultProgressIntervalStates;
+    if (const char* reserve_env = std::getenv("HEX_CACHE_RESERVE_STATES")) {
+        cache_reserve = std::max<std::size_t>(1, std::strtoull(reserve_env, nullptr, 10));
+    }
+    if (const char* interval_env = std::getenv("HEX_PROGRESS_INTERVAL_STATES")) {
+        progress_interval_states = std::max<std::uint64_t>(1, std::strtoull(interval_env, nullptr, 10));
+    }
+
+    std::cout << "transposition cache reserved for ~" << cache_reserve
+              << " states in RAM"
+              << ", progress interval=" << progress_interval_states << " states\n";
 
     for (int depth = 0; depth <= kMaxDepth; ++depth) {
+        SearchContext ctx;
+        ctx.visited.max_load_factor(0.7f);
+        ctx.visited.reserve(cache_reserve);
+        ctx.progress_interval_states = progress_interval_states;
+        ctx.target_depth = depth;
+        ctx.start_time = std::chrono::steady_clock::now();
+        ctx.last_report_time = ctx.start_time;
+
         SearchState initial;
         initial.graph = build_seed();
         initial.depth_seen.resize(initial.graph.nodes.size(), -1);
@@ -941,11 +1987,15 @@ int main() {
         initial.depth_seen[0] = 0;
         initial.todo.push_back({0, 0});
 
-        if (!expand_with_backtracking(initial, depth, kBranchingCap)) {
+        if (!expand_with_backtracking(ctx, initial, depth)) {
+            ctx.report_progress("depth-failed", -1, ctx.visited.size(), initial.todo.size(),
+                                initial.graph.nodes.size());
             std::cout << "failed to validate depth " << depth << '\n';
             return 1;
         }
-        std::cout << "validated depth " << depth << '\n';
+        ctx.report_progress("depth-complete", -1, ctx.visited.size(), 0, initial.graph.nodes.size());
+        std::cout << "validated depth " << depth
+                  << " with cache size=" << ctx.visited.size() << '\n';
     }
     return 0;
 }

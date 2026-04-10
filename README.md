@@ -30,15 +30,78 @@ Recent approach log (depth-4 push)
 - Added diagnostics for materialization/candidate dead-ends; observed repeated
   depth-2 dead-ends at leaf-root completions (e.g., no completion candidates).
 
+Methods tried since that note
+
+- Replaced the bounded local search with exhaustive backtracking over completion
+  plans.
+- Added an in-memory transposition cache for outer search states with a
+  canonicalized partial-graph fingerprint.
+- Added progress telemetry, depth counters, cache stats, and candidate
+  generation diagnostics.
+- Fixed a major correctness bug where completion plans generated from one
+  materialized root variant were being replayed onto a different variant.
+- Widened leaf-root materialization:
+  - multiple branch/split/outward assignments,
+  - generic neighborhood shell as an additional leaf variant,
+  - center-style fallback retained as another variant.
+- Relaxed the old leaf-root participation cap and shifted pruning effort toward
+  exact residual feasibility bounds instead.
+- Replaced local completion permutation search with an include/exclude
+  edge-subset search.
+- Added exact local packing bounds and early pending-root impossibility pruning
+  during both candidate generation and outer branching.
+- Added cached per-variant optimistic loop ceilings to support the new
+  feasibility checks.
+
+Current status
+
+- Depth 0 and depth 1 validate.
+- Depth 2 still fails under the current neighborhood/completion model.
+- The solver is now much closer to exhausting the modeled depth-2 search space
+  rather than timing out in obvious search-order pathologies.
+- The recurring failure is still local-root completion failure, but the exact
+  failing root moves as the model is widened:
+  - earlier runs repeatedly died at roots like `5`, `11`, and `12`,
+  - current runs often reach larger states and then die at leaf roots like `7`
+    or `8` with `no completion candidates`.
+- The important interpretation is:
+  - the remaining blocker is likely model incompleteness or overconstraint,
+    not just missing brute force.
+
+What the current code appears to prove
+
+- With the present role-specific materialization and completion rules, the
+  reachable depth-2 search space can be explored aggressively with pruning and
+  still does not yield a valid completion.
+- That is not proof that the target graph is impossible.
+- It is evidence that the current local neighborhood assumptions, especially
+  around non-center roots, are still excluding viable constructions or
+  misclassifying them.
+
+Suggestions going forward
+
+- Implement explicit `split`-root materialization instead of letting split roots
+  fall back to center/generic handling. The pattern notes already call split and
+  frontier refinement the active incomplete area.
+- Implement explicit `frontier`-root materialization for shifted roots that are
+  not yet specialized. The current generic shell is only a stopgap.
+- Revisit the leaf-root shell around failing roots (`7`, `8` in recent runs):
+  - the current 4x3 child accounting may still be too rigid,
+  - outward/frontier reuse may need to branch more than it currently does,
+  - some legal local configurations may not fit the existing branch grouping.
+- Distinguish search-order heuristics from impossibility pruning. Ordering may
+  safely use the most constrained variant; pruning must only fire when all
+  variants are impossible.
+- If deeper runs are resumed, keep the current telemetry. It is now good enough
+  to separate model failures from search failures.
+
 Next suggested experiment
 
-- Implement a full brute-force search with a transposition cache (state memo):
-  canonicalize each partial graph state (or radius-limited rooted signature)
-  and skip revisits.
-- Cache key recommendation:
-  - sorted node role list,
-  - normalized adjacency (canonical relabeling),
-  - unresolved todo frontier summary.
+- Add dedicated split-root and frontier-root neighborhood builders, then rerun
+  the depth-2 validation first before attempting deeper expansion.
+- After that, branch the failing leaf-root shell over a broader set of outward
+  reuse/grouping interpretations and check whether the repeated depth-2
+  dead-end moves again or disappears.
 
 Approximate storage cost for a full depth-4 map
 
