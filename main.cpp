@@ -196,7 +196,6 @@ struct Graph {
 
     std::optional<Neighborhood> materialize_center_neighborhood(int root) {
         Neighborhood n{};
-        nodes[root].role = Node::Role::center;
         auto branches = ensure_neighbors(root, kBranchCount, -1, Node::Role::branch);
         if (static_cast<int>(branches.size()) != kBranchCount) {
             return std::nullopt;
@@ -279,9 +278,115 @@ struct Graph {
         return n;
     }
 
+    std::optional<Neighborhood> materialize_leaf_neighborhood(int root) {
+        Neighborhood n{};
+        std::vector<int> branch_side;
+        std::vector<int> split_side;
+        std::vector<int> outward_side;
+
+        for (int nb : neighbors(root)) {
+            if (nodes[nb].role == Node::Role::branch || nodes[nb].role == Node::Role::center) {
+                branch_side.push_back(nb);
+            } else if (nodes[nb].role == Node::Role::split) {
+                split_side.push_back(nb);
+            } else {
+                outward_side.push_back(nb);
+            }
+        }
+
+        if (branch_side.empty()) {
+            auto all = neighbors(root);
+            if (all.empty()) {
+                return std::nullopt;
+            }
+            branch_side.push_back(all.front());
+        }
+
+        while (static_cast<int>(split_side.size()) < 2 && nodes[root].free_slots() > 0) {
+            int fresh = connect_new(root, Node::Role::split);
+            if (fresh == -1) {
+                break;
+            }
+            split_side.push_back(fresh);
+        }
+        if (split_side.size() < 2) {
+            return std::nullopt;
+        }
+
+        if (outward_side.empty()) {
+            int fresh = connect_new(root, Node::Role::frontier);
+            if (fresh != -1) {
+                outward_side.push_back(fresh);
+            }
+        }
+        if (outward_side.empty()) {
+            return std::nullopt;
+        }
+
+        n.branches[0] = branch_side.front();
+
+        std::array<int, 2> split_parent{-1, -1};
+        for (int i = 0; i < 2; ++i) {
+            int split = split_side[i];
+            int opposite = -1;
+            for (int nb : neighbors(split)) {
+                if (nb != root) {
+                    opposite = nb;
+                    break;
+                }
+            }
+            if (opposite == -1) {
+                opposite = connect_new(split, Node::Role::leaf);
+                if (opposite == -1) {
+                    return std::nullopt;
+                }
+                nodes[opposite].role = Node::Role::leaf;
+            }
+            n.branches[i + 1] = opposite;
+            split_parent[i] = split;
+        }
+        n.branches[3] = outward_side.front();
+
+        auto fill_children = [&](int slot, int branch_node, int exclude,
+                                 Node::Role role) -> bool {
+            auto kids = ensure_neighbors(branch_node, 3, exclude, role);
+            kids.erase(std::remove(kids.begin(), kids.end(), exclude), kids.end());
+            std::sort(kids.begin(), kids.end());
+            if (static_cast<int>(kids.size()) < 3) {
+                return false;
+            }
+            for (int j = 0; j < 3; ++j) {
+                n.children[slot][j] = kids[j];
+            }
+            return true;
+        };
+
+        if (!fill_children(0, n.branches[0], root, Node::Role::leaf)) {
+            return std::nullopt;
+        }
+        if (!fill_children(1, n.branches[1], split_parent[0], Node::Role::frontier)) {
+            return std::nullopt;
+        }
+        if (!fill_children(2, n.branches[2], split_parent[1], Node::Role::frontier)) {
+            return std::nullopt;
+        }
+        if (!fill_children(3, n.branches[3], root, Node::Role::frontier)) {
+            return std::nullopt;
+        }
+
+        return n;
+    }
+
     std::optional<Neighborhood> materialize_neighborhood(int root) {
         if (nodes[root].role == Node::Role::branch) {
             return materialize_branch_neighborhood(root);
+        }
+        if (nodes[root].role == Node::Role::leaf) {
+            auto leaf_n = materialize_leaf_neighborhood(root);
+            if (leaf_n && (rooted_loop_count(*leaf_n) >= 12 || has_completion_move(*leaf_n))) {
+                return leaf_n;
+            }
+            return materialize_center_neighborhood(root);
         }
         return materialize_center_neighborhood(root);
     }
@@ -320,61 +425,46 @@ struct Graph {
         return loops;
     }
 
-    std::vector<CompletionPlan> generate_completion_candidates(int root, int max_results) const {
-        if (nodes[root].role == Node::Role::branch) {
-            Graph greedy = *this;
-            auto maybe_branch = greedy.materialize_branch_neighborhood(root);
-            if (maybe_branch) {
-                Neighborhood n = *maybe_branch;
-                std::vector<std::pair<int, int>> chosen;
-
-                while (greedy.rooted_loop_count(n) < 12) {
-                    int best_a = -1;
-                    int best_b = -1;
-                    int best_score = -1;
-
-                    for (int a = 0; a < 4; ++a) {
-                        for (int b = a + 1; b < 4; ++b) {
-                            for (int i = 0; i < 3; ++i) {
-                                for (int j = 0; j < 3; ++j) {
-                                    int lhs = n.children[a][i];
-                                    int rhs = n.children[b][j];
-                                    if (greedy.shared_neighbor(lhs, rhs) != -1 ||
-                                        !greedy.can_split_with_new_node(lhs, rhs)) {
-                                        continue;
-                                    }
-                                    int score = 10 * (greedy.nodes[lhs].free_slots() +
-                                                      greedy.nodes[rhs].free_slots()) -
-                                                (greedy.nodes[lhs].degree() +
-                                                 greedy.nodes[rhs].degree());
-                                    if (score > best_score) {
-                                        best_score = score;
-                                        best_a = std::min(lhs, rhs);
-                                        best_b = std::max(lhs, rhs);
-                                    }
-                                }
-                            }
+    int rooted_participation_count(const Neighborhood& n, int child) const {
+        int count = 0;
+        for (int a = 0; a < 4; ++a) {
+            for (int b = a + 1; b < 4; ++b) {
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = 0; j < 3; ++j) {
+                        int lhs = n.children[a][i];
+                        int rhs = n.children[b][j];
+                        if (lhs != child && rhs != child) {
+                            continue;
+                        }
+                        if (shared_neighbor(lhs, rhs) != -1) {
+                            ++count;
                         }
                     }
-
-                    if (best_a == -1 || greedy.ensure_split(best_a, best_b) == -1) {
-                        chosen.clear();
-                        break;
-                    }
-                    chosen.push_back({best_a, best_b});
-                }
-
-                if (!chosen.empty() && greedy.rooted_loop_count(n) >= 12) {
-                    std::sort(chosen.begin(), chosen.end());
-                    chosen.erase(std::unique(chosen.begin(), chosen.end()), chosen.end());
-                    return {CompletionPlan{
-                        .add_pairs = chosen,
-                        .reused_pairs = greedy.rooted_loop_count(n) - static_cast<int>(chosen.size()),
-                        .new_nodes = static_cast<int>(chosen.size()),
-                    }};
                 }
             }
         }
+        return count;
+    }
+
+    bool has_completion_move(const Neighborhood& n) const {
+        for (int a = 0; a < 4; ++a) {
+            for (int b = a + 1; b < 4; ++b) {
+                for (int i = 0; i < 3; ++i) {
+                    for (int j = 0; j < 3; ++j) {
+                        int lhs = n.children[a][i];
+                        int rhs = n.children[b][j];
+                        if (shared_neighbor(lhs, rhs) != -1 ||
+                            can_split_with_new_node(lhs, rhs)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    std::vector<CompletionPlan> generate_completion_candidates(int root, int max_results) const {
 
         Graph base = *this;
         auto maybe_n = base.materialize_neighborhood(root);
@@ -383,120 +473,183 @@ struct Graph {
         }
         const Neighborhood& n = *maybe_n;
 
-        std::array<int, 4> branch_order{0, 1, 2, 3};
-        std::set<std::vector<std::pair<int, int>>> seen;
-        std::vector<CompletionPlan> out;
+        if (base.rooted_loop_count(root) >= 12) {
+            return {CompletionPlan{}};
+        }
 
-        do {
-            std::array<int, 3> c0{0, 1, 2};
-            do {
-                std::array<int, 3> c1{0, 1, 2};
-                do {
-                    std::array<int, 3> c2{0, 1, 2};
-                    do {
-                        std::array<int, 3> c3{0, 1, 2};
-                        do {
-                            const std::array<std::array<int, 3>, 4> child_order{{c0, c1, c2, c3}};
-                            Neighborhood ordered = n;
-                            for (int b = 0; b < 4; ++b) {
-                                ordered.branches[b] = n.branches[branch_order[b]];
-                                for (int c = 0; c < 3; ++c) {
-                                    ordered.children[b][c] =
-                                        n.children[branch_order[b]][child_order[b][c]];
+        std::optional<CompletionPlan> greedy_plan;
+        {
+            Graph greedy = base;
+            Neighborhood greedy_n = n;
+            std::vector<std::pair<int, int>> chosen;
+
+            while (greedy.rooted_loop_count(root) < 12) {
+                int best_a = -1;
+                int best_b = -1;
+                int best_score = -1;
+
+                for (int a = 0; a < 4; ++a) {
+                    for (int b = a + 1; b < 4; ++b) {
+                        for (int i = 0; i < 3; ++i) {
+                            for (int j = 0; j < 3; ++j) {
+                                int lhs = greedy_n.children[a][i];
+                                int rhs = greedy_n.children[b][j];
+                                int participation_cap =
+                                    (nodes[root].role == Node::Role::leaf) ? 3 : 2;
+                                if (greedy.rooted_participation_count(greedy_n, lhs) >=
+                                        participation_cap ||
+                                    greedy.rooted_participation_count(greedy_n, rhs) >=
+                                        participation_cap) {
+                                    continue;
+                                }
+                                if (greedy.shared_neighbor(lhs, rhs) != -1 ||
+                                    !greedy.can_split_with_new_node(lhs, rhs)) {
+                                    continue;
+                                }
+                                int score = 10 * (greedy.nodes[lhs].free_slots() +
+                                                  greedy.nodes[rhs].free_slots()) -
+                                            (greedy.nodes[lhs].degree() +
+                                             greedy.nodes[rhs].degree());
+                                if (score > best_score) {
+                                    best_score = score;
+                                    best_a = std::min(lhs, rhs);
+                                    best_b = std::max(lhs, rhs);
                                 }
                             }
+                        }
+                    }
+                }
 
-                            auto search = [&](auto&& self, const Graph& cur_graph,
-                                              const Neighborhood& cur_n,
-                                              std::vector<std::pair<int, int>>& chosen) -> void {
-                                if (static_cast<int>(out.size()) >= max_results) {
-                                    return;
-                                }
+                if (best_a == -1 || greedy.ensure_split(best_a, best_b) == -1) {
+                    chosen.clear();
+                    break;
+                }
+                chosen.push_back({best_a, best_b});
+            }
 
-                                int loops = cur_graph.rooted_loop_count(cur_n);
-                                if (loops >= 12) {
-                                    std::vector<std::pair<int, int>> normalized = chosen;
-                                    std::sort(normalized.begin(), normalized.end());
-                                    normalized.erase(
-                                        std::unique(normalized.begin(), normalized.end()),
-                                        normalized.end());
-                                    if (!seen.insert(normalized).second) {
-                                        return;
-                                    }
-                                    out.push_back(CompletionPlan{
-                                        .add_pairs = normalized,
-                                        .reused_pairs = loops - static_cast<int>(normalized.size()),
-                                        .new_nodes = static_cast<int>(normalized.size()),
-                                    });
-                                    return;
-                                }
+            if (greedy.rooted_loop_count(root) >= 12) {
+                std::sort(chosen.begin(), chosen.end());
+                chosen.erase(std::unique(chosen.begin(), chosen.end()), chosen.end());
+                greedy_plan = CompletionPlan{
+                    .add_pairs = chosen,
+                    .reused_pairs = greedy.rooted_loop_count(root) - static_cast<int>(chosen.size()),
+                    .new_nodes = static_cast<int>(chosen.size()),
+                };
+            }
+        }
 
-                                struct CandidateEdge {
-                                    int a;
-                                    int b;
-                                    int score;
-                                };
+        std::set<std::vector<std::pair<int, int>>> seen;
+        std::vector<CompletionPlan> out;
+        if (greedy_plan) {
+            out.push_back(*greedy_plan);
+            seen.insert(greedy_plan->add_pairs);
+        }
 
-                                std::vector<CandidateEdge> edges;
-                                for (int a = 0; a < 4; ++a) {
-                                    for (int b = a + 1; b < 4; ++b) {
-                                        for (int i = 0; i < 3; ++i) {
-                                            for (int j = 0; j < 3; ++j) {
-                                                int lhs = cur_n.children[a][i];
-                                                int rhs = cur_n.children[b][j];
-                                                if (cur_graph.shared_neighbor(lhs, rhs) != -1 ||
-                                                    !cur_graph.can_split_with_new_node(lhs, rhs)) {
-                                                    continue;
-                                                }
-                                                edges.push_back(CandidateEdge{
-                                                    .a = std::min(lhs, rhs),
-                                                    .b = std::max(lhs, rhs),
-                                                    .score = 10 * (cur_graph.nodes[lhs].free_slots() +
-                                                                   cur_graph.nodes[rhs].free_slots()) -
-                                                             (cur_graph.nodes[lhs].degree() +
-                                                              cur_graph.nodes[rhs].degree()),
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
+        auto search = [&](auto&& self, const Graph& cur_graph,
+                          const Neighborhood& cur_n,
+                          std::vector<std::pair<int, int>>& chosen) -> void {
+            if (static_cast<int>(out.size()) >= max_results) {
+                return;
+            }
 
-                                std::sort(edges.begin(), edges.end(), [](const CandidateEdge& lhs,
-                                                                         const CandidateEdge& rhs) {
-                                    if (lhs.score != rhs.score) {
-                                        return lhs.score > rhs.score;
-                                    }
-                                    if (lhs.a != rhs.a) {
-                                        return lhs.a < rhs.a;
-                                    }
-                                    return lhs.b < rhs.b;
-                                });
+            int loops = cur_graph.rooted_loop_count(root);
+            if (loops >= 12) {
+                std::vector<std::pair<int, int>> normalized = chosen;
+                std::sort(normalized.begin(), normalized.end());
+                normalized.erase(std::unique(normalized.begin(), normalized.end()),
+                                 normalized.end());
+                if (!seen.insert(normalized).second) {
+                    return;
+                }
+                out.push_back(CompletionPlan{
+                    .add_pairs = normalized,
+                    .reused_pairs = loops - static_cast<int>(normalized.size()),
+                    .new_nodes = static_cast<int>(normalized.size()),
+                });
+                return;
+            }
 
-                                int explored = 0;
-                                for (const auto& edge : edges) {
-                                    if (explored++ >= max_results) {
-                                        break;
-                                    }
-                                    Graph next_graph = cur_graph;
-                                    if (next_graph.ensure_split(edge.a, edge.b) == -1) {
-                                        continue;
-                                    }
-                                    chosen.push_back({edge.a, edge.b});
-                                    self(self, next_graph, cur_n, chosen);
-                                    chosen.pop_back();
-                                    if (static_cast<int>(out.size()) >= max_results) {
-                                        return;
-                                    }
-                                }
-                            };
+            struct CandidateEdge {
+                int a;
+                int b;
+                int score;
+            };
 
-                            std::vector<std::pair<int, int>> chosen;
-                            search(search, base, ordered, chosen);
-                        } while (std::next_permutation(c3.begin(), c3.end()));
-                    } while (std::next_permutation(c2.begin(), c2.end()));
-                } while (std::next_permutation(c1.begin(), c1.end()));
-            } while (std::next_permutation(c0.begin(), c0.end()));
-        } while (std::next_permutation(branch_order.begin(), branch_order.end()));
+            std::vector<CandidateEdge> edges;
+            for (int a = 0; a < 4; ++a) {
+                for (int b = a + 1; b < 4; ++b) {
+                    for (int i = 0; i < 3; ++i) {
+                        for (int j = 0; j < 3; ++j) {
+                            int lhs = cur_n.children[a][i];
+                            int rhs = cur_n.children[b][j];
+                            int participation_cap =
+                                (nodes[root].role == Node::Role::leaf) ? 3 : 2;
+                            if (cur_graph.rooted_participation_count(cur_n, lhs) >=
+                                    participation_cap ||
+                                cur_graph.rooted_participation_count(cur_n, rhs) >=
+                                    participation_cap) {
+                                continue;
+                            }
+                            if (cur_graph.shared_neighbor(lhs, rhs) != -1 ||
+                                !cur_graph.can_split_with_new_node(lhs, rhs)) {
+                                continue;
+                            }
+                            edges.push_back(CandidateEdge{
+                                .a = std::min(lhs, rhs),
+                                .b = std::max(lhs, rhs),
+                                .score = 10 * (cur_graph.nodes[lhs].free_slots() +
+                                               cur_graph.nodes[rhs].free_slots()) -
+                                         (cur_graph.nodes[lhs].degree() +
+                                          cur_graph.nodes[rhs].degree()),
+                            });
+                        }
+                    }
+                }
+            }
+
+            std::sort(edges.begin(), edges.end(), [](const CandidateEdge& lhs,
+                                                     const CandidateEdge& rhs) {
+                if (lhs.score != rhs.score) {
+                    return lhs.score > rhs.score;
+                }
+                if (lhs.a != rhs.a) {
+                    return lhs.a < rhs.a;
+                }
+                return lhs.b < rhs.b;
+            });
+            edges.erase(std::unique(edges.begin(), edges.end(),
+                                    [](const CandidateEdge& lhs,
+                                       const CandidateEdge& rhs) {
+                                        return lhs.a == rhs.a && lhs.b == rhs.b;
+                                    }),
+                        edges.end());
+
+            int remaining_needed = 12 - loops;
+            if (static_cast<int>(edges.size()) < remaining_needed) {
+                return;
+            }
+
+            static constexpr int kLocalBeam = 6;
+            int explored = 0;
+            for (const auto& edge : edges) {
+                if (explored++ >= kLocalBeam) {
+                    break;
+                }
+                Graph next_graph = cur_graph;
+                if (next_graph.ensure_split(edge.a, edge.b) == -1) {
+                    continue;
+                }
+                chosen.push_back({edge.a, edge.b});
+                self(self, next_graph, cur_n, chosen);
+                chosen.pop_back();
+                if (static_cast<int>(out.size()) >= max_results) {
+                    return;
+                }
+            }
+        };
+
+        std::vector<std::pair<int, int>> chosen;
+        search(search, base, n, chosen);
 
         std::sort(out.begin(), out.end(), [](const CompletionPlan& lhs,
                                              const CompletionPlan& rhs) {
@@ -674,19 +827,53 @@ bool expand_with_backtracking(const SearchState& state, int max_depth, int branc
         return cur.graph.validate_depth(0, max_depth);
     }
 
-    auto [root, depth] = cur.todo.front();
-    cur.todo.pop_front();
+    int chosen_index = -1;
+    int chosen_root = -1;
+    int chosen_depth = -1;
+    Graph chosen_graph;
+    std::vector<Graph::CompletionPlan> chosen_candidates;
 
-    std::vector<Graph::CompletionPlan> candidates =
-        cur.graph.generate_completion_candidates(root, branching_cap);
-    if (candidates.empty()) {
-        std::cout << "no completion candidates for root " << root
-                  << " at depth " << depth << '\n';
+    for (int i = 0; i < static_cast<int>(cur.todo.size()); ++i) {
+        auto [root, depth] = cur.todo[i];
+        Graph probe = cur.graph;
+        if (!probe.materialize_neighborhood(root)) {
+            std::cout << "failed to materialize neighborhood for root " << root
+                      << " at depth " << depth << '\n';
+            return false;
+        }
+
+        std::vector<Graph::CompletionPlan> candidates =
+            probe.generate_completion_candidates(root, branching_cap);
+        if (candidates.empty()) {
+            std::cout << "no completion candidates for root " << root
+                      << " at depth " << depth
+                      << " role=" << static_cast<int>(probe.nodes[root].role)
+                      << " degree=" << probe.nodes[root].degree() << '\n';
+            return false;
+        }
+
+        if (chosen_index == -1 ||
+            static_cast<int>(candidates.size()) < static_cast<int>(chosen_candidates.size())) {
+            chosen_index = i;
+            chosen_root = root;
+            chosen_depth = depth;
+            chosen_graph = std::move(probe);
+            chosen_candidates = std::move(candidates);
+            if (chosen_candidates.size() == 1) {
+                break;
+            }
+        }
+    }
+
+    if (chosen_index == -1) {
         return false;
     }
 
-    for (const auto& cand : candidates) {
+    cur.todo.erase(cur.todo.begin() + chosen_index);
+
+    for (const auto& cand : chosen_candidates) {
         SearchState next = cur;
+        next.graph = chosen_graph;
         bool ok = true;
         for (const auto& [a, b] : cand.add_pairs) {
             if (next.graph.ensure_split(a, b) == -1) {
@@ -701,8 +888,8 @@ bool expand_with_backtracking(const SearchState& state, int max_depth, int branc
             next.completed.resize(next.graph.nodes.size(), false);
             next.depth_seen.resize(next.graph.nodes.size(), -1);
         }
-        next.completed[root] = true;
-        if (!enqueue_neighbors(next, root, depth, max_depth)) {
+        next.completed[chosen_root] = true;
+        if (!enqueue_neighbors(next, chosen_root, chosen_depth, max_depth)) {
             continue;
         }
         if (expand_with_backtracking(next, max_depth, branching_cap)) {
@@ -743,8 +930,8 @@ Graph build_seed() {
 }
 
 int main() {
-    constexpr int kBranchingCap = 24;
-    constexpr int kMaxDepth = 7;
+    constexpr int kBranchingCap = 8;
+    constexpr int kMaxDepth = 4;
 
     for (int depth = 0; depth <= kMaxDepth; ++depth) {
         SearchState initial;
