@@ -8,6 +8,7 @@
 #include <iostream>
 #include <optional>
 #include <queue>
+#include <random>
 #include <set>
 #include <string>
 #include <tuple>
@@ -2338,53 +2339,79 @@ Graph build_pair_balanced_seed() {
     return g;
 }
 
-std::vector<Graph> build_pair_balanced_seed_exhaustive(std::size_t max_results = 0) {
-    Graph base = build_minimal_seed();
-    auto maybe_n = base.materialize_neighborhood(0);
+Graph build_pair_balanced_seed_random(std::uint64_t rng_seed) {
+    Graph g = build_minimal_seed();
+    auto maybe_n = g.materialize_neighborhood(0);
     if (!maybe_n) {
-        return {base};
+        return g;
     }
+    Graph::Neighborhood n = *maybe_n;
+    std::mt19937_64 rng(rng_seed);
 
-    std::vector<Graph::CompletionPlan> plans =
-        base.generate_completion_candidates_for_materialized(0, *maybe_n, nullptr, max_results);
+    for (int step = 0; step < 64; ++step) {
+        std::array<int, 6> pair_counts = g.rooted_pair_loop_counts(n);
+        if (g.pair_balance_satisfied(pair_counts) || !g.pair_balance_feasible(pair_counts)) {
+            break;
+        }
 
-    std::vector<Graph> out;
-    out.reserve(plans.size());
-    for (const auto& plan : plans) {
-        Graph g = base;
-        bool ok = true;
-        for (const auto& [a, b] : plan.add_pairs) {
-            if (g.ensure_split(a, b) == -1) {
-                ok = false;
+        std::vector<std::pair<int, int>> pending_pairs;
+        for (int a = 0; a < 4; ++a) {
+            for (int b = a + 1; b < 4; ++b) {
+                int pair_idx = Graph::branch_pair_index(a, b);
+                if (pair_counts[pair_idx] < 2) {
+                    pending_pairs.push_back({a, b});
+                }
+            }
+        }
+        if (pending_pairs.empty()) {
+            break;
+        }
+        std::shuffle(pending_pairs.begin(), pending_pairs.end(), rng);
+
+        bool added = false;
+        for (const auto& [a, b] : pending_pairs) {
+            std::vector<std::pair<int, int>> child_pairs;
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    int lhs = n.children[a][i];
+                    int rhs = n.children[b][j];
+                    if (g.shared_neighbor(lhs, rhs) != -1) {
+                        continue;
+                    }
+                    if (!g.can_split_with_new_node(lhs, rhs)) {
+                        continue;
+                    }
+                    child_pairs.push_back({lhs, rhs});
+                }
+            }
+            std::shuffle(child_pairs.begin(), child_pairs.end(), rng);
+            for (const auto& [lhs, rhs] : child_pairs) {
+                if (g.ensure_split(lhs, rhs) != -1) {
+                    added = true;
+                    break;
+                }
+            }
+            if (added) {
                 break;
             }
         }
-        if (ok) {
-            out.push_back(std::move(g));
+        if (!added) {
+            break;
         }
     }
-    if (out.empty()) {
-        out.push_back(build_pair_balanced_seed());
-    }
-    return out;
+    return g;
 }
 
 int main() {
     std::cout << std::unitbuf;
 
-    constexpr int kDefaultMaxDepth = 2;
+    constexpr int kMaxDepth = 2;
     constexpr std::size_t kDefaultCacheReserve = 1'000'000;
     constexpr std::uint64_t kDefaultProgressIntervalStates = 10'000;
     constexpr double kDefaultSeedTimeLimitSeconds = 0.0;
-    constexpr std::size_t kDefaultExhaustiveSeedLimit = 0;
-    int max_depth = kDefaultMaxDepth;
     std::size_t cache_reserve = kDefaultCacheReserve;
     std::uint64_t progress_interval_states = kDefaultProgressIntervalStates;
     double seed_time_limit_seconds = kDefaultSeedTimeLimitSeconds;
-    std::size_t exhaustive_seed_limit = kDefaultExhaustiveSeedLimit;
-    if (const char* max_depth_env = std::getenv("HEX_MAX_DEPTH")) {
-        max_depth = std::max(0, static_cast<int>(std::strtol(max_depth_env, nullptr, 10)));
-    }
     if (const char* reserve_env = std::getenv("HEX_CACHE_RESERVE_STATES")) {
         cache_reserve = std::max<std::size_t>(1, std::strtoull(reserve_env, nullptr, 10));
     }
@@ -2394,27 +2421,21 @@ int main() {
     if (const char* seed_limit_env = std::getenv("HEX_SEED_TIME_LIMIT_SECONDS")) {
         seed_time_limit_seconds = std::max(0.0, std::strtod(seed_limit_env, nullptr));
     }
-    if (const char* exhaustive_seed_limit_env = std::getenv("HEX_EXHAUSTIVE_SEED_LIMIT")) {
-        exhaustive_seed_limit = std::strtoull(exhaustive_seed_limit_env, nullptr, 10);
-    }
 
     std::cout << "transposition cache reserved for ~" << cache_reserve
               << " states in RAM"
               << ", progress interval=" << progress_interval_states << " states"
-              << ", per-seed-time-limit=" << seed_time_limit_seconds << "s"
-              << ", max-depth=" << max_depth
-              << ", exhaustive-seed-limit=" << exhaustive_seed_limit << '\n';
+              << ", per-seed-time-limit=" << seed_time_limit_seconds << "s\n";
 
-    for (int depth = 0; depth <= max_depth; ++depth) {
+    for (int depth = 0; depth <= kMaxDepth; ++depth) {
         std::vector<std::pair<std::string, Graph>> seed_variants;
-        std::vector<Graph> exhaustive_pair_balanced =
-            build_pair_balanced_seed_exhaustive(exhaustive_seed_limit);
-        for (std::size_t i = 0; i < exhaustive_pair_balanced.size(); ++i) {
-            seed_variants.push_back({"pair-balanced-exhaustive-" + std::to_string(i),
-                                     exhaustive_pair_balanced[i]});
-        }
         seed_variants.push_back({"image-seed", build_seed()});
         seed_variants.push_back({"minimal-seed", build_minimal_seed()});
+        seed_variants.push_back({"pair-balanced-seed", build_pair_balanced_seed()});
+        for (std::uint64_t seed = 1; seed <= 6; ++seed) {
+            seed_variants.push_back({"pair-balanced-rand-" + std::to_string(seed),
+                                     build_pair_balanced_seed_random(0x9e3779b97f4a7c15ULL + seed)});
+        }
 
         bool depth_ok = false;
         for (const auto& [seed_name, seed_graph] : seed_variants) {
