@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <limits>
 #include <queue>
 #include <random>
 #include <set>
@@ -1878,8 +1879,10 @@ struct SearchContext {
     std::uint64_t dead_end_no_candidates = 0;
     std::uint64_t materialize_failures = 0;
     std::uint64_t split_apply_failures = 0;
+    std::uint64_t local_budget_exhaustions = 0;
     std::uint64_t solutions_checked = 0;
     std::uint64_t progress_interval_states = 1000;
+    std::uint64_t local_candidate_budget_base = 0;
     double per_seed_time_limit_seconds = 0.0;
     int target_depth = 0;
     int active_root = -1;
@@ -1892,6 +1895,30 @@ struct SearchContext {
     std::chrono::steady_clock::time_point last_report_time = start_time;
     bool time_limit_hit = false;
     bool time_limit_reported = false;
+    bool budget_exhausted = false;
+
+    bool has_untried_state_paths() const {
+        for (const auto& [fp, count] : candidate_count_by_state) {
+            auto it = next_candidate_index_by_state.find(fp);
+            const std::size_t next = it == next_candidate_index_by_state.end() ? 0 : it->second;
+            if (next < count) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::uint64_t effective_budget_for_state(const StateFingerprint& fp) {
+        if (local_candidate_budget_base == 0) {
+            return std::numeric_limits<std::uint64_t>::max();
+        }
+        std::uint32_t& entries = state_entry_counts[fp];
+        ++entries;
+        const std::uint32_t shift = entries > 0 ? (entries - 1) : 0;
+        const std::uint64_t reduced =
+            shift >= 63 ? 1ULL : (local_candidate_budget_base >> shift);
+        return std::max<std::uint64_t>(1, reduced);
+    }
 
     bool has_untried_state_paths() const {
         for (const auto& [fp, count] : candidate_count_by_state) {
@@ -1948,6 +1975,7 @@ struct SearchContext {
                   << " dead_no_candidates=" << dead_end_no_candidates
                   << " materialize_failures=" << materialize_failures
                   << " split_apply_failures=" << split_apply_failures
+                  << " local_budget_exhaustions=" << local_budget_exhaustions
                   << " solutions_checked=" << solutions_checked
                   << " active_depth=" << active_depth
                   << " active_root=" << active_root
@@ -2267,6 +2295,11 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
         }
     }
 
+    if (next_candidate_index < chosen_candidates.size()) {
+        ++ctx.local_budget_exhaustions;
+        ctx.budget_exhausted = true;
+    }
+
     return false;
 }
 
@@ -2421,9 +2454,11 @@ int main() {
     constexpr std::size_t kDefaultCacheReserve = 1'000'000;
     constexpr std::uint64_t kDefaultProgressIntervalStates = 10'000;
     constexpr double kDefaultSeedTimeLimitSeconds = 0.0;
+    constexpr std::uint64_t kDefaultLocalCandidateBudget = 64;
     std::size_t cache_reserve = kDefaultCacheReserve;
     std::uint64_t progress_interval_states = kDefaultProgressIntervalStates;
     double seed_time_limit_seconds = kDefaultSeedTimeLimitSeconds;
+    std::uint64_t local_candidate_budget = kDefaultLocalCandidateBudget;
     if (const char* reserve_env = std::getenv("HEX_CACHE_RESERVE_STATES")) {
         cache_reserve = std::max<std::size_t>(1, std::strtoull(reserve_env, nullptr, 10));
     }
@@ -2433,11 +2468,15 @@ int main() {
     if (const char* seed_limit_env = std::getenv("HEX_SEED_TIME_LIMIT_SECONDS")) {
         seed_time_limit_seconds = std::max(0.0, std::strtod(seed_limit_env, nullptr));
     }
+    if (const char* budget_env = std::getenv("HEX_LOCAL_CANDIDATE_BUDGET")) {
+        local_candidate_budget = std::strtoull(budget_env, nullptr, 10);
+    }
 
     std::cout << "transposition cache reserved for ~" << cache_reserve
               << " states in RAM"
               << ", progress interval=" << progress_interval_states << " states"
-              << ", per-seed-time-limit=" << seed_time_limit_seconds << "s\n";
+              << ", per-seed-time-limit=" << seed_time_limit_seconds << "s"
+              << ", local-candidate-budget=" << local_candidate_budget << '\n';
 
     for (int depth = 0; depth <= kMaxDepth; ++depth) {
         std::vector<std::pair<std::string, Graph>> seed_variants;
@@ -2456,6 +2495,7 @@ int main() {
             ctx.visited.reserve(cache_reserve);
             ctx.progress_interval_states = progress_interval_states;
             ctx.per_seed_time_limit_seconds = seed_time_limit_seconds;
+            ctx.local_candidate_budget_base = local_candidate_budget;
             ctx.target_depth = depth;
             ctx.start_time = std::chrono::steady_clock::now();
             ctx.last_report_time = ctx.start_time;
@@ -2467,13 +2507,23 @@ int main() {
             initial.depth_seen[0] = 0;
             initial.todo.push_back({0, 0});
 
-            if (expand_with_backtracking(ctx, initial, depth)) {
-                std::cout << "depth " << depth << " solved with " << seed_name << '\n';
-                ctx.report_progress("depth-complete", -1, ctx.visited.size(), 0,
-                                    initial.graph.nodes.size());
-                std::cout << "validated depth " << depth
-                          << " with cache size=" << ctx.visited.size() << '\n';
-                depth_ok = true;
+            while (true) {
+                ctx.visited.clear();
+                ctx.budget_exhausted = false;
+                if (expand_with_backtracking(ctx, initial, depth)) {
+                    std::cout << "depth " << depth << " solved with " << seed_name << '\n';
+                    ctx.report_progress("depth-complete", -1, ctx.visited.size(), 0,
+                                        initial.graph.nodes.size());
+                    std::cout << "validated depth " << depth
+                              << " with cache size=" << ctx.visited.size() << '\n';
+                    depth_ok = true;
+                    break;
+                }
+                if (ctx.time_limit_hit || !ctx.has_untried_state_paths() || !ctx.budget_exhausted) {
+                    break;
+                }
+            }
+            if (depth_ok) {
                 break;
             }
             if (ctx.time_limit_hit) {
