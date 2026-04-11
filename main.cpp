@@ -1332,12 +1332,6 @@ struct Graph {
                 std::array<int, 6> pair_counts =
                     rooted_pair_loop_counts(static_cast<int>(node.id));
                 if (loops != 12 || !pair_balance_satisfied(pair_counts)) {
-                    std::cout << "loop failure at node " << node.id
-                              << ": loops=" << loops << " pair-counts=[";
-                    for (int i = 0; i < 6; ++i) {
-                        std::cout << pair_counts[i] << (i + 1 == 6 ? "" : ",");
-                    }
-                    std::cout << "]\n";
                     return false;
                 }
             }
@@ -1863,6 +1857,10 @@ StateFingerprint fingerprint_state(const SearchState& state) {
 
 struct SearchContext {
     std::unordered_set<StateFingerprint, StateFingerprintHasher> visited;
+    std::unordered_map<StateFingerprint, std::size_t, StateFingerprintHasher>
+        next_candidate_index_by_state;
+    std::unordered_map<StateFingerprint, std::size_t, StateFingerprintHasher>
+        candidate_count_by_state;
     std::unordered_set<CompletionFingerprint, CompletionFingerprintHasher> dead_local_completion_roots;
     std::uint64_t states_entered = 0;
     std::uint64_t cache_hits = 0;
@@ -1894,6 +1892,17 @@ struct SearchContext {
     std::chrono::steady_clock::time_point last_report_time = start_time;
     bool time_limit_hit = false;
     bool time_limit_reported = false;
+
+    bool has_untried_state_paths() const {
+        for (const auto& [fp, count] : candidate_count_by_state) {
+            auto it = next_candidate_index_by_state.find(fp);
+            const std::size_t next = it == next_candidate_index_by_state.end() ? 0 : it->second;
+            if (next < count) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     void ensure_depth_slot(int depth) {
         if (depth >= static_cast<int>(states_by_depth.size())) {
@@ -2187,6 +2196,7 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
         }
         chosen_candidates = generate_root_candidates(cur.graph, chosen_root, &ctx, 0,
                                                      &pending_roots, max_depth);
+        ctx.candidate_count_by_state[fp] = chosen_candidates.size();
         ++ctx.candidate_batches;
         ctx.candidate_plans += chosen_candidates.size();
         if (chosen_candidates.empty()) {
@@ -2210,7 +2220,9 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
 
     cur.todo.erase(cur.todo.begin() + chosen_index);
 
-    for (const auto& cand : chosen_candidates) {
+    std::size_t& next_candidate_index = ctx.next_candidate_index_by_state[fp];
+    while (next_candidate_index < chosen_candidates.size()) {
+        const auto& cand = chosen_candidates[next_candidate_index++];
         SearchState next = cur;
         next.graph = cand.graph;
         bool ok = true;
