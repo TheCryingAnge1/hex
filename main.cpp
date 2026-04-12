@@ -714,7 +714,7 @@ struct Graph {
         return total_usable_capacity / 2;
     }
 
-    static constexpr std::array<std::pair<int, int>, 54> child_pair_positions() {
+    static std::array<std::pair<int, int>, 54> child_pair_positions() {
         std::array<std::pair<int, int>, 54> pairs{};
         int pos = 0;
         for (int a = 0; a < 12; ++a) {
@@ -741,7 +741,7 @@ struct Graph {
     int max_additional_loops_exact_bound(
         const Neighborhood& n, int root,
         const std::vector<std::pair<int, int>>& legal_edges) const {
-        static constexpr auto kPairs = child_pair_positions();
+        static const auto kPairs = child_pair_positions();
 
         std::array<int, 12> capacities{};
         std::unordered_map<int, int> index_by_child;
@@ -973,7 +973,7 @@ struct Graph {
         std::unordered_set<LocalCompletionState, LocalCompletionStateHasher> local_seen;
         local_seen.reserve(1 << 15);
 
-        static constexpr auto kPairs = child_pair_positions();
+        static const auto kPairs = child_pair_positions();
 
         auto search = [&](auto&& self, const Graph& cur_graph,
                           const Neighborhood& cur_n, std::uint64_t forbidden_mask,
@@ -2123,7 +2123,7 @@ bool has_dead_root_cache(SearchContext* ctx, const CompletionFingerprint& fp) {
     if (!ctx) {
         return false;
     }
-    return ctx->dead_local_completion_roots.contains(fp);
+    return ctx->dead_local_completion_roots.find(fp) != ctx->dead_local_completion_roots.end();
 }
 
 void remember_dead_root_cache(SearchContext* ctx, const CompletionFingerprint& fp) {
