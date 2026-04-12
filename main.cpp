@@ -2535,7 +2535,10 @@ int main() {
                     depth_ok = true;
                     break;
                 }
-                if (ctx.time_limit_hit || !ctx.has_untried_state_paths()) {
+                if (ctx.time_limit_hit) {
+                    break;
+                }
+                if (!ctx.budget_exhausted && !ctx.has_untried_state_paths()) {
                     break;
                 }
             }
