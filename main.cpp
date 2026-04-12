@@ -2192,11 +2192,16 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
     int chosen_root = -1;
     int chosen_depth = -1;
     std::vector<RootCandidate> chosen_candidates;
-    std::uint64_t best_estimate = 0;
+    std::uint64_t best_estimate = std::numeric_limits<std::uint64_t>::max();
+    bool found_feasible_root = false;
 
     for (int i = 0; i < static_cast<int>(cur.todo.size()); ++i) {
         auto [root, depth] = cur.todo[i];
         RootGenerationEstimate estimate = analyze_root_generation(cur.graph, root, &ctx);
+        if (!estimate.any_feasible_variant) {
+            continue;
+        }
+        found_feasible_root = true;
         if (chosen_index == -1 || estimate.order_cost < best_estimate ||
             (estimate.order_cost == best_estimate && depth < chosen_depth) ||
             (estimate.order_cost == best_estimate && depth == chosen_depth && root < chosen_root)) {
@@ -2205,6 +2210,15 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
             chosen_depth = depth;
             best_estimate = estimate.order_cost;
         }
+    }
+
+    if (!found_feasible_root) {
+        ++ctx.dead_end_no_candidates;
+        ++ctx.dead_ends_by_depth[active_depth];
+        ctx.report_progress("no-feasible-root", active_depth, ctx.visited.size(),
+                            cur.todo.size(), cur.graph.nodes.size());
+        std::cout << "no feasible roots remain at depth " << active_depth << '\n';
+        return false;
     }
 
     if (chosen_index != -1) {
