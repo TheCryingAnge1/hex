@@ -2,9 +2,11 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <csignal>
 #include <deque>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <limits>
@@ -1757,6 +1759,22 @@ struct StateFingerprintHasher {
     }
 };
 
+volatile std::sig_atomic_t g_interrupt_requested = 0;
+
+void handle_interrupt_signal(int) {
+    g_interrupt_requested = 1;
+}
+
+std::string make_resume_file_path(int depth, const std::string& seed_name) {
+    std::string sanitized = seed_name;
+    for (char& ch : sanitized) {
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) || ch == '-' || ch == '_')) {
+            ch = '_';
+        }
+    }
+    return ".hex_resume_depth_" + std::to_string(depth) + "_seed_" + sanitized + ".txt";
+}
+
 StateFingerprint fingerprint_state(const SearchState& state) {
     const int node_count = static_cast<int>(state.graph.nodes.size());
     if (node_count == 0) {
@@ -1901,6 +1919,101 @@ struct SearchContext {
     bool time_limit_hit = false;
     bool time_limit_reported = false;
     bool budget_exhausted = false;
+
+    bool save_resume(const std::string& path) const {
+        std::ofstream out(path + ".tmp", std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        out << "HEX_RESUME_V1\n";
+        out << target_depth << '\n';
+        std::size_t saved_entries = 0;
+        for (const auto& [fp, count] : candidate_count_by_state) {
+            const auto next_it = next_candidate_index_by_state.find(fp);
+            const std::size_t next = next_it == next_candidate_index_by_state.end() ? 0 : next_it->second;
+            if (count == 0 || next >= count) {
+                continue;
+            }
+            const auto sig_it = candidate_signature_by_state.find(fp);
+            const std::uint64_t signature =
+                sig_it == candidate_signature_by_state.end() ? 0 : sig_it->second;
+            const auto entry_it = state_entry_counts.find(fp);
+            const std::uint32_t entry_count =
+                entry_it == state_entry_counts.end() ? 0 : entry_it->second;
+            out << fp.lo << ' ' << fp.hi << ' ' << next << ' ' << count << ' '
+                << signature << ' ' << entry_count << '\n';
+            ++saved_entries;
+        }
+        out << "END " << saved_entries << '\n';
+        out.flush();
+        if (!out) {
+            return false;
+        }
+        out.close();
+        std::remove(path.c_str());
+        return std::rename((path + ".tmp").c_str(), path.c_str()) == 0;
+    }
+
+    bool load_resume(const std::string& path) {
+        std::ifstream in(path);
+        if (!in) {
+            return false;
+        }
+        std::string header;
+        if (!std::getline(in, header) || header != "HEX_RESUME_V1") {
+            return false;
+        }
+        int file_depth = -1;
+        if (!(in >> file_depth) || file_depth != target_depth) {
+            return false;
+        }
+        candidate_count_by_state.clear();
+        next_candidate_index_by_state.clear();
+        candidate_signature_by_state.clear();
+        state_entry_counts.clear();
+        while (in) {
+            std::string marker;
+            in >> marker;
+            if (!in) {
+                break;
+            }
+            if (marker == "END") {
+                std::size_t ignored = 0;
+                in >> ignored;
+                break;
+            }
+            StateFingerprint fp{};
+            fp.lo = std::strtoull(marker.c_str(), nullptr, 10);
+            in >> fp.hi;
+            std::size_t next = 0;
+            std::size_t count = 0;
+            std::uint64_t signature = 0;
+            std::uint32_t entry_count = 0;
+            in >> next >> count >> signature >> entry_count;
+            if (!in || count == 0 || next >= count) {
+                continue;
+            }
+            candidate_count_by_state.emplace(fp, count);
+            next_candidate_index_by_state.emplace(fp, next);
+            candidate_signature_by_state.emplace(fp, signature);
+            if (entry_count != 0) {
+                state_entry_counts.emplace(fp, entry_count);
+            }
+        }
+        return true;
+    }
+
+    std::size_t resumable_path_count() const {
+        std::size_t count = 0;
+        for (const auto& [fp, value] : candidate_count_by_state) {
+            const auto it = next_candidate_index_by_state.find(fp);
+            const std::size_t next = it == next_candidate_index_by_state.end() ? 0 : it->second;
+            if (next < value) {
+                ++count;
+            }
+        }
+        return count;
+    }
 
     bool has_untried_state_paths() const {
         for (const auto& [fp, count] : candidate_count_by_state) {
@@ -2192,11 +2305,16 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
     int chosen_root = -1;
     int chosen_depth = -1;
     std::vector<RootCandidate> chosen_candidates;
-    std::uint64_t best_estimate = 0;
+    std::uint64_t best_estimate = std::numeric_limits<std::uint64_t>::max();
+    bool found_feasible_root = false;
 
     for (int i = 0; i < static_cast<int>(cur.todo.size()); ++i) {
         auto [root, depth] = cur.todo[i];
         RootGenerationEstimate estimate = analyze_root_generation(cur.graph, root, &ctx);
+        if (!estimate.any_feasible_variant) {
+            continue;
+        }
+        found_feasible_root = true;
         if (chosen_index == -1 || estimate.order_cost < best_estimate ||
             (estimate.order_cost == best_estimate && depth < chosen_depth) ||
             (estimate.order_cost == best_estimate && depth == chosen_depth && root < chosen_root)) {
@@ -2205,6 +2323,15 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
             chosen_depth = depth;
             best_estimate = estimate.order_cost;
         }
+    }
+
+    if (!found_feasible_root) {
+        ++ctx.dead_end_no_candidates;
+        ++ctx.dead_ends_by_depth[active_depth];
+        ctx.report_progress("no-feasible-root", active_depth, ctx.visited.size(),
+                            cur.todo.size(), cur.graph.nodes.size());
+        std::cout << "no feasible roots remain at depth " << active_depth << '\n';
+        return false;
     }
 
     if (chosen_index != -1) {
@@ -2470,6 +2597,7 @@ Graph build_pair_balanced_seed_random(std::uint64_t rng_seed) {
 
 int main() {
     std::cout << std::unitbuf;
+    std::signal(SIGINT, handle_interrupt_signal);
 
     constexpr int kMaxDepth = 2;
     constexpr std::size_t kDefaultCacheReserve = 1'000'000;
@@ -2520,6 +2648,11 @@ int main() {
             ctx.target_depth = depth;
             ctx.start_time = std::chrono::steady_clock::now();
             ctx.last_report_time = ctx.start_time;
+            const std::string resume_path = make_resume_file_path(depth, seed_name);
+            if (ctx.load_resume(resume_path)) {
+                std::cout << "loaded resume paths for depth " << depth << ", seed "
+                          << seed_name << ": " << ctx.resumable_path_count() << '\n';
+            }
 
             SearchState initial;
             initial.graph = seed_graph;
@@ -2531,15 +2664,24 @@ int main() {
             while (true) {
                 ctx.visited.clear();
                 ctx.budget_exhausted = false;
+                if (g_interrupt_requested) {
+                    const bool saved = ctx.save_resume(resume_path);
+                    std::cout << "interrupt requested, "
+                              << (saved ? "saved" : "failed to save")
+                              << " resume data to " << resume_path << '\n';
+                    return 130;
+                }
                 if (expand_with_backtracking(ctx, initial, depth)) {
                     std::cout << "depth " << depth << " solved with " << seed_name << '\n';
                     ctx.report_progress("depth-complete", -1, ctx.visited.size(), 0,
                                         initial.graph.nodes.size());
                     std::cout << "validated depth " << depth
                               << " with cache size=" << ctx.visited.size() << '\n';
+                    std::remove(resume_path.c_str());
                     depth_ok = true;
                     break;
                 }
+                ctx.save_resume(resume_path);
                 if (ctx.time_limit_hit) {
                     if (ctx.has_untried_state_paths()) {
                         ctx.time_limit_hit = false;
