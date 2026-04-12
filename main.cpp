@@ -1862,6 +1862,10 @@ struct SearchContext {
         next_candidate_index_by_state;
     std::unordered_map<StateFingerprint, std::size_t, StateFingerprintHasher>
         candidate_count_by_state;
+    std::unordered_map<StateFingerprint, std::uint64_t, StateFingerprintHasher>
+        candidate_signature_by_state;
+    std::unordered_map<StateFingerprint, std::uint32_t, StateFingerprintHasher>
+        state_entry_counts;
     std::unordered_set<CompletionFingerprint, CompletionFingerprintHasher> dead_local_completion_roots;
     std::uint64_t states_entered = 0;
     std::uint64_t cache_hits = 0;
@@ -1918,17 +1922,6 @@ struct SearchContext {
         const std::uint64_t reduced =
             shift >= 63 ? 1ULL : (local_candidate_budget_base >> shift);
         return std::max<std::uint64_t>(1, reduced);
-    }
-
-    bool has_untried_state_paths() const {
-        for (const auto& [fp, count] : candidate_count_by_state) {
-            auto it = next_candidate_index_by_state.find(fp);
-            const std::size_t next = it == next_candidate_index_by_state.end() ? 0 : it->second;
-            if (next < count) {
-                return true;
-            }
-        }
-        return false;
     }
 
     void ensure_depth_slot(int depth) {
@@ -2224,6 +2217,25 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
         }
         chosen_candidates = generate_root_candidates(cur.graph, chosen_root, &ctx, 0,
                                                      &pending_roots, max_depth);
+        std::uint64_t candidate_signature = 1469598103934665603ULL;
+        for (const auto& cand : chosen_candidates) {
+            candidate_signature ^= static_cast<std::uint64_t>(cand.graph.nodes.size());
+            candidate_signature *= 1099511628211ULL;
+            candidate_signature ^= static_cast<std::uint64_t>(cand.plan.add_pairs.size());
+            candidate_signature *= 1099511628211ULL;
+            for (const auto& [a, b] : cand.plan.add_pairs) {
+                candidate_signature ^= static_cast<std::uint64_t>(a + 1);
+                candidate_signature *= 1099511628211ULL;
+                candidate_signature ^= static_cast<std::uint64_t>(b + 1);
+                candidate_signature *= 1099511628211ULL;
+            }
+        }
+        auto sig_it = ctx.candidate_signature_by_state.find(fp);
+        if (sig_it == ctx.candidate_signature_by_state.end() ||
+            sig_it->second != candidate_signature) {
+            ctx.next_candidate_index_by_state[fp] = 0;
+        }
+        ctx.candidate_signature_by_state[fp] = candidate_signature;
         ctx.candidate_count_by_state[fp] = chosen_candidates.size();
         ++ctx.candidate_batches;
         ctx.candidate_plans += chosen_candidates.size();
@@ -2249,7 +2261,11 @@ bool expand_with_backtracking(SearchContext& ctx, const SearchState& state, int 
     cur.todo.erase(cur.todo.begin() + chosen_index);
 
     std::size_t& next_candidate_index = ctx.next_candidate_index_by_state[fp];
-    while (next_candidate_index < chosen_candidates.size()) {
+    const std::uint64_t entry_budget = ctx.effective_budget_for_state(fp);
+    std::uint64_t attempts_this_entry = 0;
+    while (next_candidate_index < chosen_candidates.size() &&
+           attempts_this_entry < entry_budget) {
+        ++attempts_this_entry;
         const auto& cand = chosen_candidates[next_candidate_index++];
         SearchState next = cur;
         next.graph = cand.graph;
@@ -2519,7 +2535,7 @@ int main() {
                     depth_ok = true;
                     break;
                 }
-                if (ctx.time_limit_hit || !ctx.has_untried_state_paths() || !ctx.budget_exhausted) {
+                if (ctx.time_limit_hit || !ctx.has_untried_state_paths()) {
                     break;
                 }
             }
