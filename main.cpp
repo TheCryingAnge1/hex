@@ -70,6 +70,7 @@ void note_legal_edge_prune(SearchContext* ctx);
 void note_dead_root_cache_hit(SearchContext* ctx);
 void note_impossible_root_prune(SearchContext* ctx);
 bool is_search_timed_out(SearchContext* ctx);
+bool has_time_limit_been_hit(const SearchContext* ctx);
 bool should_use_fast_bounds(SearchContext* ctx);
 struct RootGenerationEstimate {
     std::uint64_t order_cost = 0;
@@ -1158,7 +1159,7 @@ struct Graph {
         std::vector<std::pair<int, int>> chosen;
         search(search, *this, n, 0, chosen);
 
-        if (out.empty()) {
+        if (out.empty() && !has_time_limit_been_hit(ctx)) {
             remember_dead_root_cache(ctx, initial_fp);
         }
 
@@ -2028,6 +2029,10 @@ bool is_search_timed_out(SearchContext* ctx) {
     return ctx->timed_out();
 }
 
+bool has_time_limit_been_hit(const SearchContext* ctx) {
+    return ctx && ctx->time_limit_hit;
+}
+
 bool should_use_fast_bounds(SearchContext* ctx) {
     if (!ctx) {
         return false;
@@ -2536,6 +2541,13 @@ int main() {
                     break;
                 }
                 if (ctx.time_limit_hit) {
+                    if (ctx.has_untried_state_paths()) {
+                        ctx.time_limit_hit = false;
+                        ctx.time_limit_reported = false;
+                        ctx.start_time = std::chrono::steady_clock::now();
+                        ctx.last_report_time = ctx.start_time;
+                        continue;
+                    }
                     break;
                 }
                 if (!ctx.budget_exhausted && !ctx.has_untried_state_paths()) {
