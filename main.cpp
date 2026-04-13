@@ -1906,6 +1906,7 @@ struct SearchContext {
     std::uint64_t solutions_checked = 0;
     std::uint64_t progress_interval_states = 1000;
     std::uint64_t local_candidate_budget_base = 0;
+    std::uint64_t retry_exhausted_sweeps_remaining = 0;
     double per_seed_time_limit_seconds = 0.0;
     int target_depth = 0;
     int active_root = -1;
@@ -1929,11 +1930,13 @@ struct SearchContext {
         out << target_depth << '\n';
         std::size_t saved_entries = 0;
         for (const auto& [fp, count] : candidate_count_by_state) {
-            const auto next_it = next_candidate_index_by_state.find(fp);
-            const std::size_t next = next_it == next_candidate_index_by_state.end() ? 0 : next_it->second;
-            if (count == 0 || next >= count) {
+            if (count == 0) {
                 continue;
             }
+            const auto next_it = next_candidate_index_by_state.find(fp);
+            const std::size_t raw_next =
+                next_it == next_candidate_index_by_state.end() ? 0 : next_it->second;
+            const std::size_t next = std::min(raw_next, count);
             const auto sig_it = candidate_signature_by_state.find(fp);
             const std::uint64_t signature =
                 sig_it == candidate_signature_by_state.end() ? 0 : sig_it->second;
@@ -1990,9 +1993,10 @@ struct SearchContext {
             std::uint64_t signature = 0;
             std::uint32_t entry_count = 0;
             in >> next >> count >> signature >> entry_count;
-            if (!in || count == 0 || next >= count) {
+            if (!in || count == 0) {
                 continue;
             }
+            next = std::min(next, count);
             candidate_count_by_state.emplace(fp, count);
             next_candidate_index_by_state.emplace(fp, next);
             candidate_signature_by_state.emplace(fp, signature);
@@ -2024,6 +2028,21 @@ struct SearchContext {
             }
         }
         return false;
+    }
+
+    bool rewind_exhausted_state_paths_for_retry() {
+        bool rewound_any = false;
+        for (const auto& [fp, count] : candidate_count_by_state) {
+            if (count == 0) {
+                continue;
+            }
+            std::size_t& next = next_candidate_index_by_state[fp];
+            if (next >= count) {
+                next = 0;
+                rewound_any = true;
+            }
+        }
+        return rewound_any;
     }
 
     std::uint64_t effective_budget_for_state(const StateFingerprint& fp) {
@@ -2118,6 +2137,10 @@ struct SearchContext {
     }
 
     bool timed_out() {
+        if (g_interrupt_requested) {
+            time_limit_hit = true;
+            return true;
+        }
         if (time_limit_hit) {
             return true;
         }
@@ -2598,16 +2621,19 @@ Graph build_pair_balanced_seed_random(std::uint64_t rng_seed) {
 int main() {
     std::cout << std::unitbuf;
     std::signal(SIGINT, handle_interrupt_signal);
+    std::signal(SIGTERM, handle_interrupt_signal);
 
     constexpr int kMaxDepth = 2;
     constexpr std::size_t kDefaultCacheReserve = 1'000'000;
     constexpr std::uint64_t kDefaultProgressIntervalStates = 10'000;
     constexpr double kDefaultSeedTimeLimitSeconds = 0.0;
     constexpr std::uint64_t kDefaultLocalCandidateBudget = 64;
+    constexpr std::uint64_t kDefaultRetryExhaustedSweeps = 0;
     std::size_t cache_reserve = kDefaultCacheReserve;
     std::uint64_t progress_interval_states = kDefaultProgressIntervalStates;
     double seed_time_limit_seconds = kDefaultSeedTimeLimitSeconds;
     std::uint64_t local_candidate_budget = kDefaultLocalCandidateBudget;
+    std::uint64_t retry_exhausted_sweeps = kDefaultRetryExhaustedSweeps;
     if (const char* reserve_env = std::getenv("HEX_CACHE_RESERVE_STATES")) {
         cache_reserve = std::max<std::size_t>(1, std::strtoull(reserve_env, nullptr, 10));
     }
@@ -2620,12 +2646,16 @@ int main() {
     if (const char* budget_env = std::getenv("HEX_LOCAL_CANDIDATE_BUDGET")) {
         local_candidate_budget = std::strtoull(budget_env, nullptr, 10);
     }
+    if (const char* retry_sweeps_env = std::getenv("HEX_RETRY_EXHAUSTED_SWEEPS")) {
+        retry_exhausted_sweeps = std::strtoull(retry_sweeps_env, nullptr, 10);
+    }
 
     std::cout << "transposition cache reserved for ~" << cache_reserve
               << " states in RAM"
               << ", progress interval=" << progress_interval_states << " states"
               << ", per-seed-time-limit=" << seed_time_limit_seconds << "s"
-              << ", local-candidate-budget=" << local_candidate_budget << '\n';
+              << ", local-candidate-budget=" << local_candidate_budget
+              << ", retry-exhausted-sweeps=" << retry_exhausted_sweeps << '\n';
 
     for (int depth = 0; depth <= kMaxDepth; ++depth) {
         std::vector<std::pair<std::string, Graph>> seed_variants;
@@ -2645,6 +2675,7 @@ int main() {
             ctx.progress_interval_states = progress_interval_states;
             ctx.per_seed_time_limit_seconds = seed_time_limit_seconds;
             ctx.local_candidate_budget_base = local_candidate_budget;
+            ctx.retry_exhausted_sweeps_remaining = retry_exhausted_sweeps;
             ctx.target_depth = depth;
             ctx.start_time = std::chrono::steady_clock::now();
             ctx.last_report_time = ctx.start_time;
@@ -2693,6 +2724,17 @@ int main() {
                     break;
                 }
                 if (!ctx.budget_exhausted && !ctx.has_untried_state_paths()) {
+                    if (ctx.retry_exhausted_sweeps_remaining > 0 &&
+                        ctx.rewind_exhausted_state_paths_for_retry()) {
+                        --ctx.retry_exhausted_sweeps_remaining;
+                        std::cout << "seed " << seed_name
+                                  << " rewound exhausted state paths for retry sweep, remaining="
+                                  << ctx.retry_exhausted_sweeps_remaining << '\n';
+                        continue;
+                    }
+                    std::cout << "seed " << seed_name
+                              << " exhausted all resumable state paths at depth "
+                              << depth << '\n';
                     break;
                 }
             }
